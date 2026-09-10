@@ -27,6 +27,15 @@ Trois relevés d'exemple sont fournis pour tester l'import :
 - Trois types de transaction : revenu, dépense, virement interne.
 - Saisie et modification manuelles, notes et tags libres.
 - Total personnalisable : tous les comptes ou seulement certains.
+- **Sélection multiple** dans la liste : une case par ligne, une case « tout » à trois états qui
+  ne porte que sur le résultat filtré, **Maj+clic** pour cocher une plage entière. Une barre
+  d'actions apparaît en bas avec le nombre et le total de la sélection, et permet d'affecter une
+  catégorie, changer le type, ajouter ou retirer des tags, marquer comme professionnel, ou
+  supprimer. Chaque action de masse s'annule d'un `Ctrl+Z`.
+- Un **virement interne peut recevoir une catégorie**, comme n'importe quelle autre transaction.
+  Elle sert à l'étiqueter et à le retrouver ; il n'entre dans les statistiques que si l'option
+  « virements internes » est cochée — et dans ce cas la somme du camembert par catégorie retombe
+  exactement sur le total des dépenses.
 - Les virements internes peuvent être comptés ou non dans le résultat. Entre deux comptes
   suivis, leurs deux jambes s'annulent : le résultat ne bouge pas, ce qui est le comportement
   correct pour un simple déplacement d'argent.
@@ -147,7 +156,9 @@ Calcule le **chiffre d'affaires nécessaire pour atteindre un revenu net donné*
 | `N` | Nouvelle transaction |
 | `/` | Recherche |
 | `Ctrl+Z` | Annuler |
-| `Échap` | Fermer une fenêtre |
+| `Échap` | Fermer une fenêtre, ou vider la sélection |
+| `Ctrl+A` | Tout sélectionner (vue Transactions) |
+| `Maj+clic` | Cocher une plage de lignes |
 | `1` … `9` | Naviguer entre les onglets |
 
 ## Comment marquer une épargne

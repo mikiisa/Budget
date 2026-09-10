@@ -119,6 +119,12 @@ tbody tr:hover{background:var(--surface2)}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .tablewrap{overflow-x:auto}
 .pos{color:var(--pos)} .neg{color:var(--neg)}
+tr.sel{background:var(--accent-soft)!important}
+td.pick,th.pick{width:34px;text-align:center;padding-left:12px;cursor:default}
+.selbar{position:sticky;bottom:0;z-index:30;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);box-shadow:0 -4px 18px rgba(16,24,40,.10);padding:10px var(--pad);
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
+html[data-dark="1"] .selbar{box-shadow:0 -4px 18px rgba(0,0,0,.45)}
 .chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface2);
   border:1px solid var(--border);border-radius:999px;padding:1px 9px;font-size:.82em;white-space:nowrap}
 .chip .sw{width:8px;height:8px;border-radius:50%;flex:none}
@@ -1173,11 +1179,16 @@ function totals(txs){
            savingRate: income ? net / income * 100 : 0 };
 }
 /** Dépenses par catégorie, triées. */
+/* Les répartitions suivent la même règle que `totals` : un virement interne
+   n'y entre que si l'option « compter les virements internes » est active.
+   Auparavant elles l'excluaient en dur, si bien qu'avec l'option cochée la somme
+   du camembert par catégorie ne retombait pas sur le total des dépenses. */
 function byCategory(txs, kind = "expense"){
   const m = new Map();
   for (const t of txs){
-    if (kind === "expense" && !(t.amount < 0 && t.type !== "transfer")) continue;
-    if (kind === "income"  && !(t.amount > 0 && t.type !== "transfer")) continue;
+    if (!transferCounts(t)) continue;
+    if (kind === "expense" && !(t.amount < 0)) continue;
+    if (kind === "income"  && !(t.amount > 0)) continue;
     const id = t.categoryId || "__none";
     m.set(id, (m.get(id) || 0) + Math.abs(t.amount));
   }
@@ -1190,7 +1201,7 @@ function byCategory(txs, kind = "expense"){
 function byAxis(txs, axis){
   const m = new Map();
   for (const t of txs){
-    if (!(t.amount < 0 && t.type !== "transfer")) continue;
+    if (!transferCounts(t) || !(t.amount < 0)) continue;
     const c = catById(t.categoryId);
     const k = c ? c[axis] : "__none";
     m.set(k, (m.get(k) || 0) + Math.abs(t.amount));
@@ -1245,7 +1256,7 @@ function recentMonths(n = 12){
 function budgetStatus(txs){
   const spent = new Map();
   for (const t of txs){
-    if (!(t.amount < 0 && t.type !== "transfer")) continue;
+    if (!transferCounts(t) || !(t.amount < 0)) continue;
     spent.set(t.categoryId, (spent.get(t.categoryId) || 0) + Math.abs(t.amount));
   }
   const rows = Object.entries(S.budgets)
@@ -1263,7 +1274,7 @@ function budgetStatus(txs){
 let VIEW = "dash";
 const VIEWS = {};
 
-function go(v){ VIEW = v; render(); location.hash = v; }
+function go(v){ if (v !== "tx") clearSel(); VIEW = v; render(); location.hash = v; }
 function render(){
   applyTheme();
   $$("#nav .tab").forEach(b => b.setAttribute("aria-current", String(b.dataset.view === VIEW)));
@@ -1570,6 +1581,11 @@ ACTIONS.print = () => window.print();
 
 /* --- Vue : transactions -------------------------------------------------- */
 let FILTER = { q:"", cat:"", acc:"", type:"", min:"", max:"", tag:"", uncat:false };
+/* Sélection multiple de la vue Transactions : ids cochés, et index de la
+   dernière case cliquée pour le Maj+clic sur une plage. */
+let SEL = new Set(), SEL_ANCHOR = null;
+const selTx = () => S.transactions.filter(t => SEL.has(t.id));
+function clearSel(){ SEL.clear(); SEL_ANCHOR = null; }
 let SORT = { key:"date", dir:-1 };
 const TX_COLS = {
   date:{ label:"Date", get:t => fmtDate(t.date), sort:t => t.date },
@@ -1652,20 +1668,175 @@ VIEWS.tx = () => {
       <span class="muted">·</span> dépenses <span class="neg">${money(T.expense)}</span>
       <span class="muted">·</span> résultat <b class="${T.net>=0?"pos":"neg"}">${money(T.net, true)}</b>
       <div class="grow"></div>
-      <button class="sm" data-act="bulkCat" title="Classer toutes les lignes affichées">Classer en masse</button>
+      <button class="sm" data-act="selAll" title="Cocher toutes les lignes affichées">☑ Tout sélectionner</button>
     </div>
     <div class="card tablewrap" style="padding:0">
       <table><thead><tr>
+        <th class="pick nosort"><input type="checkbox" id="sel-all" data-act="selAllBox"
+          title="Cocher ou décocher les lignes affichées"></th>
         ${cols.map(c => `<th class="${TX_COLS[c].cls||""}" data-act="sort:${c}">${TX_COLS[c].label}${SORT.key===c?(SORT.dir>0?" ▲":" ▼"):""}</th>`).join("")}
         <th class="nosort"></th></tr></thead>
-      <tbody>${list.length ? list.map(t => `<tr ${t.needsReview?'style="background:color-mix(in srgb,var(--warn) 8%,transparent)"':""}>
+      <tbody>${list.length ? list.map((t, i) => `<tr data-row="${t.id}" class="${SEL.has(t.id)?"sel":""}"
+          ${t.needsReview && !SEL.has(t.id) ?'style="background:color-mix(in srgb,var(--warn) 8%,transparent)"':""}>
+          <td class="pick"><input type="checkbox" data-pick="${t.id}" data-idx="${i}"
+            ${SEL.has(t.id)?"checked":""}></td>
           ${cols.map(c => `<td class="${TX_COLS[c].cls||""}">${TX_COLS[c].get(t)}</td>`).join("")}
           <td style="white-space:nowrap"><button class="ghost sm" data-act="editTx:${t.id}" title="Modifier">✎</button>
             <button class="ghost sm" data-act="delTx:${t.id}" title="Supprimer">🗑</button></td></tr>`).join("")
-        : `<tr><td colspan="${cols.length+1}" class="muted" style="padding:24px;text-align:center">
+        : `<tr><td colspan="${cols.length+2}" class="muted" style="padding:24px;text-align:center">
              Aucune transaction ne correspond. ${S.transactions.length ? "" : "Commence par un import CSV ou une saisie manuelle."}</td></tr>`}
       </tbody></table>
-    </div>`;
+    </div>
+    <div class="selbar noprint hide" id="selbar"></div>`;
+};
+
+/* --- Sélection multiple ---------------------------------------------------
+   Cocher une case ne relance pas `render()` : sur une liste de plusieurs
+   centaines de lignes, on perdrait la position de défilement à chaque clic.
+   Seuls la barre d'actions et le surlignage de la ligne sont mis à jour.     */
+function initSelection(){
+  const boxes = $$("[data-pick]");
+  if (!boxes.length){ updateSelUI(); return; }
+  boxes.forEach(box => {
+    box.addEventListener("click", e => {
+      const idx = +box.dataset.idx;
+      if (e.shiftKey && SEL_ANCHOR != null){
+        const [a, b] = [Math.min(SEL_ANCHOR, idx), Math.max(SEL_ANCHOR, idx)];
+        for (const other of boxes){
+          const i = +other.dataset.idx;
+          if (i >= a && i <= b){
+            other.checked = box.checked;
+            box.checked ? SEL.add(other.dataset.pick) : SEL.delete(other.dataset.pick);
+          }
+        }
+      } else {
+        box.checked ? SEL.add(box.dataset.pick) : SEL.delete(box.dataset.pick);
+      }
+      SEL_ANCHOR = idx;
+      updateSelUI();
+    });
+  });
+  const all = $("#sel-all");
+  all && all.addEventListener("click", () => {
+    boxes.forEach(bx => { bx.checked = all.checked;
+      all.checked ? SEL.add(bx.dataset.pick) : SEL.delete(bx.dataset.pick); });
+    SEL_ANCHOR = null;
+    updateSelUI();
+  });
+  updateSelUI();
+}
+/** Rafraîchit surlignage, case d'en-tête et barre d'actions, sans re-rendu. */
+function updateSelUI(){
+  const bar = $("#selbar"); if (!bar) return;
+  $$("[data-row]").forEach(tr => tr.classList.toggle("sel", SEL.has(tr.dataset.row)));
+  const boxes = $$("[data-pick]");
+  const n = boxes.filter(b => SEL.has(b.dataset.pick)).length;
+  const all = $("#sel-all");
+  if (all){
+    all.checked = n > 0 && n === boxes.length;
+    all.indeterminate = n > 0 && n < boxes.length;   // case partielle
+  }
+  bar.classList.toggle("hide", !SEL.size);
+  if (!SEL.size) return;
+  const sel = selTx();
+  const somme = sum(sel, t => t.amount);
+  bar.innerHTML = `<b>${SEL.size}</b> sélectionnée(s)
+    <span class="muted">· total <span class="${somme<0?"neg":"pos"}"
+      style="font-variant-numeric:tabular-nums">${money(somme, true)}</span></span>
+    <div class="grow"></div>
+    <button class="primary sm" data-act="selCat">🏷️ Catégorie</button>
+    <button class="sm" data-act="selType">↔ Type</button>
+    <button class="sm" data-act="selTags">＃ Tags</button>
+    <button class="sm" data-act="selPro">💼 Pro</button>
+    <button class="sm danger" data-act="selDel">🗑 Supprimer</button>
+    <button class="sm ghost" data-act="selNone">Désélectionner</button>`;
+  wire(bar);
+}
+ACTIONS.selAll = () => { filteredTx().forEach(t => SEL.add(t.id)); render(); };
+ACTIONS.selNone = () => { clearSel(); render(); };
+ACTIONS.selAllBox = () => {};   // le comportement réel est câblé dans initSelection
+
+ACTIONS.selCat = () => modal({ title:`Classer ${SEL.size} transaction(s)`,
+  body:`<p class="muted" style="margin:0">La catégorie sera appliquée à toutes les lignes cochées.</p>
+    <label class="f"><span>Catégorie</span><select id="bulk-cat">
+      <option value="">— retirer la catégorie —</option>
+      ${S.categories.filter(c=>!c.archived).map(c => `<option value="${c.id}">${esc(catPath(c.id))}</option>`).join("")}
+    </select></label>`,
+  footer:`<button data-close>Annuler</button><button class="primary" data-act="selCatGo">Appliquer</button>` });
+ACTIONS.selCatGo = () => {
+  const id = $("#bulk-cat").value;
+  const sel = selTx();
+  snapshot("classement de la sélection");
+  for (const t of sel){ t.categoryId = id; t.needsReview = false; t.reviewReason = ""; t.locked = true; }
+  save(); closeModal(); render();
+  toast(`${sel.length} transaction(s) classée(s)`);
+  // une règle n'a de sens que si toutes les lignes partagent le même cœur de libellé
+  const keys = new Set(sel.map(t => labelKey(t.label)));
+  if (id && keys.size === 1 && [...keys][0]) proposeRule(sel[0].label, id);
+};
+ACTIONS.selType = () => modal({ title:`Changer le type de ${SEL.size} transaction(s)`,
+  body:`<p class="muted" style="margin:0">Le signe des montants est ajusté : une dépense devient
+      négative, un revenu positif. Un virement garde son sens actuel.</p>
+    <label class="f"><span>Type</span><select id="bulk-type">
+      <option value="expense">Dépense</option>
+      <option value="income">Revenu</option>
+      <option value="transfer">Virement interne</option></select></label>`,
+  footer:`<button data-close>Annuler</button><button class="primary" data-act="selTypeGo">Appliquer</button>` });
+ACTIONS.selTypeGo = () => {
+  const type = $("#bulk-type").value, sel = selTx();
+  snapshot("changement de type");
+  for (const t of sel){
+    const amt = Math.abs(t.amount);
+    t.type = type;
+    if (type === "income") t.amount = amt;
+    else if (type === "expense") t.amount = -amt;
+    t.needsReview = false; t.reviewReason = ""; t.locked = true;
+  }
+  if (type === "transfer") matchTransfers({ silent:true });
+  save(); closeModal(); render();
+  toast(`${sel.length} transaction(s) reclassée(s)`);
+};
+ACTIONS.selTags = () => modal({ title:`Tags de ${SEL.size} transaction(s)`,
+  body:`<label class="f"><span>Ajouter ces tags (séparés par des virgules)</span>
+      <input id="bulk-tag-add" placeholder="vacances, remboursable"></label>
+    <label class="f"><span>Retirer ces tags</span><input id="bulk-tag-del"></label>
+    <p class="muted" style="margin:0;font-size:.88em">Les tags déjà présents et non listés ici sont conservés.</p>`,
+  footer:`<button data-close>Annuler</button><button class="primary" data-act="selTagsGo">Appliquer</button>` });
+ACTIONS.selTagsGo = () => {
+  const split = v => v.split(",").map(x => x.trim()).filter(Boolean);
+  const add = split($("#bulk-tag-add").value), del = new Set(split($("#bulk-tag-del").value));
+  const sel = selTx();
+  snapshot("tags de la sélection");
+  for (const t of sel){
+    const set = new Set([...(t.tags || []), ...add]);
+    del.forEach(x => set.delete(x));
+    t.tags = [...set];
+  }
+  save(); closeModal(); render(); toast(`Tags mis à jour sur ${sel.length} ligne(s)`);
+};
+ACTIONS.selPro = () => {
+  const sel = selTx();
+  const tous = sel.every(t => t.proRevenue);
+  snapshot("marquage professionnel");
+  for (const t of sel) t.proRevenue = !tous;
+  save(); render();
+  toast(tous ? `${sel.length} ligne(s) démarquée(s)` : `${sel.length} ligne(s) marquée(s) « pro »`);
+};
+ACTIONS.selDel = () => {
+  const sel = selTx();
+  if (!confirm(`Supprimer ${sel.length} transaction(s) ? Ctrl+Z permet d'annuler.`)) return;
+  snapshot("suppression de la sélection");
+  const ids = new Set(sel.map(t => t.id));
+  for (const t of sel){
+    if (t.transferPeerId){
+      const p = S.transactions.find(x => x.id === t.transferPeerId); if (p) p.transferPeerId = null;
+    }
+    if (isSplit(t)) clearSplits(t);
+  }
+  S.transactions = S.transactions.filter(t => !ids.has(t.id));
+  pruneOrphanLegs();
+  clearSel();
+  save(); render(); toast(`${sel.length} transaction(s) supprimée(s)`);
 };
 ACTIONS.filt = (k, el) => { FILTER[k] = el.type === "checkbox" ? el.checked : el.value;
   const keep = el.dataset.on === "input"; const pos = el.selectionStart; render();
@@ -1709,7 +1880,10 @@ function txForm(t){
         value="${t.amount != null ? Math.abs(t.amount) : ""}" placeholder="0,00"></label>
     </div>
     <div id="f-catwrap"><label class="f"><span>Catégorie</span><select id="f-cat">
-      <option value="">— non catégorisé —</option>${catOpts()}</select></label></div>
+      <option value="">— non catégorisé —</option>${catOpts()}</select></label>
+      <p id="f-cathint" class="muted ${t.type==="transfer"?"":"hide"}" style="margin:6px 0 0;font-size:.88em">
+        Sur un virement interne, la catégorie sert à l'étiqueter et à le retrouver. Elle n'entre dans
+        les statistiques que si l'option « virements internes » est cochée dans le sélecteur de période.</p></div>
     <div id="f-transferwrap" class="${t.type==="transfer"?"":"hide"}">
       <label class="f"><span>Compte de contrepartie (facultatif)</span><select id="f-counter">
         <option value="">— non précisé —</option>${accs.filter(a => a.id !== t.accountId).map(a =>
@@ -1807,8 +1981,12 @@ ACTIONS.unpair = id => {
 function hookTypeSwitch(root){
   const sel = $("#f-type", root); if (!sel) return;
   const upd = () => {
-    $("#f-transferwrap", root).classList.toggle("hide", sel.value !== "transfer");
-    $("#f-catwrap", root).classList.toggle("hide", sel.value === "transfer");
+    const vir = sel.value === "transfer";
+    $("#f-transferwrap", root).classList.toggle("hide", !vir);
+    // la catégorie reste accessible même pour un virement : masquer le champ
+    // rendait tout simplement impossible de catégoriser une ligne classée
+    // « virement interne » par l'import
+    $("#f-cathint", root).classList.toggle("hide", !vir);
   };
   sel.addEventListener("change", upd); upd();
 }
@@ -2099,20 +2277,7 @@ ACTIONS.reviewAllOther = () => {
   }
   save(); render();
 };
-ACTIONS.bulkCat = () => {
-  const list = filteredTx();
-  modal({ title:`Classer ${list.length} transaction(s)`,
-    body:`<p class="muted" style="margin:0">Toutes les lignes actuellement affichées recevront cette catégorie.</p>
-      <label class="f"><span>Catégorie</span><select id="bulk-cat">${S.categories.filter(c=>!c.archived)
-        .map(c => `<option value="${c.id}">${esc(catPath(c.id))}</option>`).join("")}</select></label>`,
-    footer:`<button data-close>Annuler</button><button class="primary" data-act="bulkCatGo">Appliquer</button>` });
-};
-ACTIONS.bulkCatGo = () => {
-  const id = $("#bulk-cat").value, ids = new Set(filteredTx().map(t => t.id));
-  snapshot("classement en masse");
-  for (const t of S.transactions) if (ids.has(t.id)){ t.categoryId = id; t.needsReview = false; t.locked = true; }
-  save(); closeModal(); render(); toast("Classement appliqué");
-};
+
 
 /* --- Vue : comptes ------------------------------------------------------- */
 VIEWS.accounts = () => {
@@ -2867,7 +3032,7 @@ VIEWS.stats = () => {
     ${a>=b?"▲":"▼"} ${pct(Math.abs((a-b)/b*100), 0)}</span>`;
   // top marchands
   const merch = new Map();
-  for (const t of txs) if (t.amount < 0 && t.type !== "transfer"){
+  for (const t of txs) if (t.amount < 0 && transferCounts(t)){
     const k = labelKey(t.label) || t.label;
     const e = merch.get(k) || { label: t.label, total: 0, n: 0 };
     e.total += -t.amount; e.n++; merch.set(k, e);
@@ -2878,7 +3043,7 @@ VIEWS.stats = () => {
   const topCats = cats.slice(0, 10);
   const matrix = topCats.map(c => yearMonths.map(m => round2(sum(
     S.transactions.filter(t => ymOf(t.date) === m && ids.includes(t.accountId)
-      && t.amount < 0 && t.type !== "transfer" && (t.categoryId || "__none") === c.id), t => -t.amount))));
+      && t.amount < 0 && transferCounts(t) && (t.categoryId || "__none") === c.id), t => -t.amount))));
 
   return `<div class="row"><h1 style="margin:0">Statistiques <span class="muted" style="font-weight:400">— ${periodLabel()}</span></h1>
       <div class="grow"></div><button data-act="print">🖨️ Imprimer</button>
@@ -3009,7 +3174,7 @@ VIEWS.budgets = () => {
         <th class="nosort" style="min-width:140px">Avancement</th><th class="num nosort">Reste</th></tr></thead><tbody>
         ${cats.map(c => {
           const b = S.budgets[c.id] || 0;
-          const used = sum(txs.filter(t => t.categoryId === c.id && t.amount < 0 && t.type !== "transfer"), t => -t.amount);
+          const used = sum(txs.filter(t => t.categoryId === c.id && t.amount < 0 && transferCounts(t)), t => -t.amount);
           const p = b ? clamp(used / b * 100, 0, 100) : 0;
           return `<tr><td><span class="chip"><i class="sw" style="background:${catColor(c.id)}"></i>${esc(catPath(c.id))}</span></td>
             <td class="num" style="max-width:130px"><input type="number" step="10" value="${b||""}" placeholder="—"
@@ -3045,7 +3210,7 @@ ACTIONS.budgetAuto = () => {
   const ids = selectedAccountIds();
   for (const c of S.categories.filter(c => c.kind === "expense")){
     const tot = sum(S.transactions.filter(t => t.categoryId === c.id && t.amount < 0
-      && t.type !== "transfer" && ms.includes(ymOf(t.date)) && ids.includes(t.accountId)), t => -t.amount);
+      && transferCounts(t) && ms.includes(ymOf(t.date)) && ids.includes(t.accountId)), t => -t.amount);
     const avg = tot / ms.length;
     if (avg >= 5) S.budgets[c.id] = Math.round(avg / 5) * 5; else delete S.budgets[c.id];
   }
@@ -4371,7 +4536,9 @@ VIEWS.settings = () => {
       <section class="card blk" data-span="12"><h3>Raccourcis et zone sensible</h3>
         <p class="muted"><span class="kbd">N</span> nouvelle transaction ·
           <span class="kbd">/</span> recherche · <span class="kbd">Ctrl+Z</span> annuler ·
-          <span class="kbd">Échap</span> fermer une fenêtre · <span class="kbd">1</span>…<span class="kbd">9</span> onglets</p>
+          <span class="kbd">Ctrl+A</span> tout sélectionner (Transactions) ·
+          <span class="kbd">Maj+clic</span> cocher une plage ·
+          <span class="kbd">Échap</span> fermer ou désélectionner · <span class="kbd">1</span>…<span class="kbd">9</span> onglets</p>
         <div class="sep"></div>
         <div class="row tight">
           <button class="danger" data-act="wipeTx">Supprimer toutes les transactions</button>
@@ -4587,7 +4754,16 @@ $("#nav").addEventListener("click", e => {
   const b = e.target.closest(".tab"); if (b) go(b.dataset.view);
 });
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") return closeModal();
+  if (e.key === "Escape"){
+    // une modale ouverte a la priorité ; sinon Échap vide la sélection
+    if ($("#modals").children.length) return closeModal();
+    if (SEL.size){ clearSel(); return render(); }
+    return closeModal();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a"
+      && VIEW === "tx" && !/input|textarea|select/i.test(e.target.tagName)){
+    e.preventDefault(); return ACTIONS.selAll();
+  }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !/input|textarea|select/i.test(e.target.tagName)){
     e.preventDefault(); return undo();
   }
@@ -4600,7 +4776,16 @@ document.addEventListener("keydown", e => {
 });
 // Les vues sont ré-affichées à chaque render : on rebranche ce qui a besoin du DOM.
 const _render = render;
-render = function(){ _render(); initDashDnD(); initDrop(); };
+render = function(){
+  // une ligne supprimée ou sortie du filtre ne doit pas rester fantôme dans la sélection
+  if (SEL.size){
+    const visibles = new Set(VIEW === "tx" ? filteredTx().map(t => t.id) : []);
+    for (const id of [...SEL]) if (!visibles.has(id)) SEL.delete(id);
+  }
+  _render();
+  initDashDnD(); initDrop();
+  if (VIEW === "tx") initSelection();
+};
 
 boot();
 </script>
