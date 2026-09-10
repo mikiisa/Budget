@@ -490,7 +490,6 @@ function freshState(){
     version: 1,
     meta: { createdAt: Date.now(), savedAt: 0, lastBackupAt: 0 },
     settings: {
-      countTransfers: false,        // compter les virements internes dans le résultat
       selectedAccounts: null,       // null = tous les comptes
       period: { mode: "month", ym: todayISO().slice(0, 7), year: yOf(todayISO()), from: "", to: "" },
       askOnPersonTransfer: true,    // demander la nature des virements à particulier
@@ -933,13 +932,34 @@ function applyAutoSplits(batchId){
   return n;
 }
 
+/** Le type suit le signe : positif = revenu, négatif = dépense. Seul le marquage
+    « virement interne » est un choix ; le reste se déduit et ne peut pas diverger. */
+const typeOf = t => t.type === "transfer" ? "transfer" : (t.amount >= 0 ? "income" : "expense");
+/** Réaligne les données existantes ou importées dont le type contredit le signe. */
+function normalizeTypes(txs){
+  let n = 0;
+  for (const t of txs){
+    const want = typeOf(t);
+    if (t.type !== want){ t.type = want; n++; }
+  }
+  return n;
+}
+
 /** Classement automatique à l'import : type, catégorie, mise en file d'attente. */
+/** La catégorie de nature « épargne », si elle existe. */
+const savingsCategory = () => S.categories.find(c => c.kind === "expense" && c.nature === "epargne" && !c.archived);
+
 function autoClassify(tx){
   const kwAcc = accountByKeyword(tx.label, tx.accountId);
   if (kwAcc){
     tx.type = "transfer";
     tx.counterAccountId = kwAcc.id;
     tx.needsReview = false;
+    // une sortie vers une épargne compte comme une mise de côté : sans catégorie
+    // elle apparaîtrait en dépense « non catégorisé »
+    if (kwAcc.savings && tx.amount < 0 && !tx.categoryId){
+      const c = savingsCategory(); if (c) tx.categoryId = c.id;
+    }
     return tx;
   }
   tx.type = tx.amount >= 0 ? "income" : "expense";
@@ -1157,40 +1177,79 @@ function periodLabel(p = S.settings.period){
   if (p.mode === "range") return `${p.from ? fmtDate(p.from) : "début"} → ${p.to ? fmtDate(p.to) : "aujourd'hui"}`;
   return "tout l'historique";
 }
-/* Les deux jambes d'un virement interne sont comptées, ou aucune : c'est ce qui
-   garde le résultat juste. Si les deux comptes sont dans le périmètre, elles
-   s'annulent (un mouvement interne n'appauvrit personne) ; si un seul l'est, la
-   sortie compte pour ce qu'elle est — de l'argent qui quitte le périmètre suivi. */
-const transferCounts = t => t.type !== "transfer" || S.settings.countTransfers;
+/* --- Comptage des virements internes --------------------------------------
+   Tout tient dans une seule notion : le « périmètre dépensable », c'est-à-dire
+   les comptes sélectionnés qui ne sont pas des épargnes.
+
+     Une jambe de virement compte si — et seulement si — son propre compte est
+     dans le périmètre dépensable et sa contrepartie en est dehors.
+
+   Courant → Livret A : la sortie compte (mise de côté), l'entrée non.
+   Courant → Compte joint suivi : rien ne compte, le mouvement est neutre.
+   Courant → compte non suivi : la sortie compte, l'argent a quitté le périmètre.
+   Livret A → Courant : l'entrée compte, une reprise sur l'épargne est un revenu.
+
+   Cette règle remplace l'ancien réglage global « compter les virements » : il ne
+   savait dire que tout ou rien, et compter les deux jambes d'un mouvement neutre
+   gonflait les totaux bruts de revenus et de dépenses du même montant, faussant
+   « quel pourcentage de mes revenus je dépense ».                              */
+function spendableIds(){
+  const sav = new Set(savingsAccounts().map(a => a.id));
+  return new Set(selectedAccountIds().filter(id => !sav.has(id)));
+}
+/** Les comptes de contrepartie connus d'une ligne, du plus sûr au moins sûr. */
+function counterAccountsOf(t){
+  if (isSplit(t)) return t.splits.map(sp => sp.accountId);
+  if (t.splitParentId){
+    const p = S.transactions.find(x => x.id === t.splitParentId);
+    if (p) return [p.accountId];
+  }
+  if (t.transferPeerId){
+    const p = S.transactions.find(x => x.id === t.transferPeerId);
+    if (p) return [p.accountId];
+  }
+  return t.counterAccountId ? [t.counterAccountId] : [];
+}
+/** Le montant d'une ligne tel qu'il doit peser dans les totaux. */
+function countedAmount(t, spend = spendableIds()){
+  if (t.type !== "transfer") return t.amount;
+  if (!spend.has(t.accountId)) return 0;      // épargne ou compte hors périmètre
+  if (isSplit(t)){
+    // chaque destination est jugée séparément : sur 500 € répartis en 300 € vers
+    // un livret et 200 € vers un compte joint suivi, seuls les 300 € sortent
+    return -sum(t.splits.filter(sp => !spend.has(sp.accountId)), sp => sp.amount);
+  }
+  const counters = counterAccountsOf(t);
+  if (!counters.length) return t.amount;      // contrepartie inconnue : l'argent sort
+  return counters.some(id => spend.has(id)) ? 0 : t.amount;
+}
 
 /** Bilan d'une liste de transactions. */
 function totals(txs){
+  const spend = spendableIds();
   let income = 0, expense = 0, transferIn = 0, transferOut = 0;
   for (const t of txs){
     if (t.type === "transfer"){
       if (t.amount >= 0) transferIn += t.amount; else transferOut += -t.amount;
-      if (!transferCounts(t)) continue;
     }
-    if (t.amount >= 0) income += t.amount;
-    else expense += -t.amount;
+    const a = countedAmount(t, spend);
+    if (a >= 0) income += a; else expense += -a;
   }
   const net = income - expense;
   return { income, expense, net, transferIn, transferOut,
            savingRate: income ? net / income * 100 : 0 };
 }
-/** Dépenses par catégorie, triées. */
-/* Les répartitions suivent la même règle que `totals` : un virement interne
-   n'y entre que si l'option « compter les virements internes » est active.
-   Auparavant elles l'excluaient en dur, si bien qu'avec l'option cochée la somme
-   du camembert par catégorie ne retombait pas sur le total des dépenses. */
+/** Dépenses par catégorie, triées. Les montants sont ceux réellement comptés,
+    si bien que la somme du camembert retombe toujours sur le total des dépenses. */
 function byCategory(txs, kind = "expense"){
+  const spend = spendableIds();
   const m = new Map();
   for (const t of txs){
-    if (!transferCounts(t)) continue;
-    if (kind === "expense" && !(t.amount < 0)) continue;
-    if (kind === "income"  && !(t.amount > 0)) continue;
+    const a = countedAmount(t, spend);
+    if (kind === "expense" && !(a < 0)) continue;
+    if (kind === "income"  && !(a > 0)) continue;
     const id = t.categoryId || "__none";
-    m.set(id, (m.get(id) || 0) + Math.abs(t.amount));
+    m.set(id, (m.get(id) || 0) + Math.abs(a));
   }
   return [...m].map(([id, value]) => ({
     id, value, label: id === "__none" ? "Non catégorisé" : catPath(id),
@@ -1199,12 +1258,14 @@ function byCategory(txs, kind = "expense"){
 }
 /** Répartition fixe/variable et essentiel/loisir/épargne. */
 function byAxis(txs, axis){
+  const spend = spendableIds();
   const m = new Map();
   for (const t of txs){
-    if (!transferCounts(t) || !(t.amount < 0)) continue;
+    const a = countedAmount(t, spend);
+    if (!(a < 0)) continue;
     const c = catById(t.categoryId);
     const k = c ? c[axis] : "__none";
-    m.set(k, (m.get(k) || 0) + Math.abs(t.amount));
+    m.set(k, (m.get(k) || 0) + Math.abs(a));
   }
   const LB = { fixe:["Fixe","var(--c1)"], variable:["Variable","var(--c3)"],
                essentiel:["Essentiel","var(--c1)"], loisir:["Loisir","var(--c4)"],
@@ -1254,10 +1315,12 @@ function recentMonths(n = 12){
 }
 /** Reste à dépenser / dépassement, à partir des budgets par catégorie. */
 function budgetStatus(txs){
+  const spend = spendableIds();
   const spent = new Map();
   for (const t of txs){
-    if (!transferCounts(t) || !(t.amount < 0)) continue;
-    spent.set(t.categoryId, (spent.get(t.categoryId) || 0) + Math.abs(t.amount));
+    const a = countedAmount(t, spend);
+    if (!(a < 0)) continue;
+    spent.set(t.categoryId, (spent.get(t.categoryId) || 0) + Math.abs(a));
   }
   const rows = Object.entries(S.budgets)
     .filter(([id, amt]) => amt > 0 && catById(id))
@@ -1368,9 +1431,7 @@ function periodPicker(){
 function accountSelector(){
   const sel = S.settings.selectedAccounts;
   const n = sel && sel.length ? sel.length : activeAccounts().length;
-  return `<button data-act="pickAccounts">🏦 ${sel && sel.length ? `${n} compte(s)` : "Tous les comptes"} ▾</button>
-    <label class="inline" title="Faire apparaître les virements internes dans les revenus et les dépenses. Entre deux comptes suivis, les deux jambes s'annulent : le résultat ne change pas.">
-      <input type="checkbox" ${S.settings.countTransfers?"checked":""} data-act="toggleTransfers"> virements internes</label>`;
+  return `<button data-act="pickAccounts">🏦 ${sel && sel.length ? `${n} compte(s)` : "Tous les comptes"} ▾</button>`;
 }
 ACTIONS.periodMode = (_, el) => { S.settings.period.mode = el.value; save(); render(); };
 ACTIONS.setYm     = (_, el) => { S.settings.period.ym = el.value; save(); render(); };
@@ -1378,7 +1439,6 @@ ACTIONS.setYear   = (_, el) => { S.settings.period.year = el.value; save(); rend
 ACTIONS.setFrom   = (_, el) => { S.settings.period.from = el.value; save(); render(); };
 ACTIONS.setTo     = (_, el) => { S.settings.period.to = el.value; save(); render(); };
 ACTIONS.shiftMonth = d => { S.settings.period.ym = addMonths(S.settings.period.ym, +d); save(); render(); };
-ACTIONS.toggleTransfers = (_, el) => { S.settings.countTransfers = el.checked; save(); render(); };
 ACTIONS.pickAccounts = () => {
   const sel = S.settings.selectedAccounts || [];
   modal({ title:"Comptes pris en compte dans les totaux",
@@ -1440,17 +1500,22 @@ function dashBlock(id, txs, T){
         <div class="stat"><div class="k">${bs.over > 0 ? "Trop dépensé" : "Reste à dépenser"}</div>
           <div class="v ${bs.over>0?"neg":"pos"}">${money(bs.over > 0 ? bs.over : bs.left)}</div>
           <div class="s">${bs.budget ? `sur ${money(bs.budget)} budgétés` : `<a href="#budgets" data-act="goto:budgets">définir des budgets</a>`}</div></div>
-      </div>`;
+      </div>
+      <p class="muted" style="margin:10px 0 0;font-size:.86em">Un virement entre deux comptes suivis
+        s'annule et ne pèse sur rien. Un virement vers une épargne compte comme une sortie, et une
+        reprise sur l'épargne comme une entrée.</p>`;
     }
     case "split": {
       const data = [{ label:"Revenus", value:T.income, color:"var(--pos)" },
                     { label:"Dépenses", value:T.expense, color:"var(--neg)" }];
+      const versEpargne = sum(txs.filter(t => t.type === "transfer" && countedAmount(t) < 0),
+                              t => -countedAmount(t));
       return donut(data, { center: money(T.net, true, 0) }) + legend(data) +
         (T.transferIn || T.transferOut ? `<p class="muted" style="margin:8px 0 0;font-size:.88em">
-          Virements internes sur la période : ${money(T.transferOut)} sortis, ${money(T.transferIn)} entrés —
-          ${S.settings.countTransfers
-            ? "comptés dans les revenus et les dépenses ; entre deux comptes suivis ils s'annulent et ne changent pas le résultat"
-            : "exclus des revenus comme des dépenses"}.</p>` : "");
+          Virements internes : ${money(T.transferOut)} sortis, ${money(T.transferIn)} entrés.
+          ${versEpargne ? `<b>${money(versEpargne)}</b> comptent comme une sortie — épargne ou compte non suivi ;
+            le reste s'annule entre comptes suivis.`
+            : "Ils s'annulent entre comptes suivis et ne changent pas le résultat."}</p>` : "");
     }
     case "cats": {
       const d = byCategory(txs).slice(0, 9);
@@ -1745,7 +1810,7 @@ function updateSelUI(){
       style="font-variant-numeric:tabular-nums">${money(somme, true)}</span></span>
     <div class="grow"></div>
     <button class="primary sm" data-act="selCat">🏷️ Catégorie</button>
-    <button class="sm" data-act="selType">↔ Type</button>
+    <button class="sm" data-act="selType">± Signe / virement</button>
     <button class="sm" data-act="selTags">＃ Tags</button>
     <button class="sm" data-act="selPro">💼 Pro</button>
     <button class="sm danger" data-act="selDel">🗑 Supprimer</button>
@@ -1774,27 +1839,36 @@ ACTIONS.selCatGo = () => {
   const keys = new Set(sel.map(t => labelKey(t.label)));
   if (id && keys.size === 1 && [...keys][0]) proposeRule(sel[0].label, id);
 };
-ACTIONS.selType = () => modal({ title:`Changer le type de ${SEL.size} transaction(s)`,
-  body:`<p class="muted" style="margin:0">Le signe des montants est ajusté : une dépense devient
-      négative, un revenu positif. Un virement garde son sens actuel.</p>
-    <label class="f"><span>Type</span><select id="bulk-type">
-      <option value="expense">Dépense</option>
-      <option value="income">Revenu</option>
-      <option value="transfer">Virement interne</option></select></label>`,
+ACTIONS.selType = () => modal({ title:`Signe et virement — ${SEL.size} transaction(s)`,
+  body:`<p class="muted" style="margin:0">Revenu ou dépense se déduit du signe du montant : il n'y a
+      donc que le sens à corriger. Le marquage « virement interne » est indépendant.</p>
+    <label class="f"><span>Sens du montant</span><select id="bulk-sign">
+      <option value="">— ne rien changer —</option>
+      <option value="out">Tout en sortie (montants négatifs)</option>
+      <option value="in">Tout en entrée (montants positifs)</option>
+      <option value="flip">Inverser le signe</option></select></label>
+    <label class="f"><span>Virement interne</span><select id="bulk-internal">
+      <option value="">— ne rien changer —</option>
+      <option value="1">Marquer comme virement interne</option>
+      <option value="0">Ce ne sont pas des virements</option></select></label>`,
   footer:`<button data-close>Annuler</button><button class="primary" data-act="selTypeGo">Appliquer</button>` });
 ACTIONS.selTypeGo = () => {
-  const type = $("#bulk-type").value, sel = selTx();
-  snapshot("changement de type");
+  const sign = $("#bulk-sign").value, internal = $("#bulk-internal").value, sel = selTx();
+  if (!sign && !internal) return toast("Rien à changer");
+  snapshot("signe et virement");
   for (const t of sel){
-    const amt = Math.abs(t.amount);
-    t.type = type;
-    if (type === "income") t.amount = amt;
-    else if (type === "expense") t.amount = -amt;
+    const a = Math.abs(t.amount);
+    if (sign === "out") t.amount = -a;
+    else if (sign === "in") t.amount = a;
+    else if (sign === "flip") t.amount = -t.amount;
+    if (internal === "1") t.type = "transfer";
+    else if (internal === "0") t.type = t.amount >= 0 ? "income" : "expense";
+    else t.type = typeOf(t);        // garde le marquage, réaligne le reste sur le signe
     t.needsReview = false; t.reviewReason = ""; t.locked = true;
   }
-  if (type === "transfer") matchTransfers({ silent:true });
+  if (internal === "1") matchTransfers({ silent:true });
   save(); closeModal(); render();
-  toast(`${sel.length} transaction(s) reclassée(s)`);
+  toast(`${sel.length} transaction(s) mise(s) à jour`);
 };
 ACTIONS.selTags = () => modal({ title:`Tags de ${SEL.size} transaction(s)`,
   body:`<label class="f"><span>Ajouter ces tags (séparés par des virgules)</span>
@@ -1872,12 +1946,19 @@ function txForm(t){
     </div>
     <label class="f"><span>Libellé</span><input id="f-label" value="${esc(t.label || "")}" placeholder="Ex. CARREFOUR CITY"></label>
     <div class="grid2">
-      <label class="f"><span>Type</span><select id="f-type">
-        <option value="expense" ${t.type==="expense"?"selected":""}>Dépense</option>
-        <option value="income"  ${t.type==="income" ?"selected":""}>Revenu</option>
-        <option value="transfer"${t.type==="transfer"?"selected":""}>Virement interne</option></select></label>
-      <label class="f"><span>Montant (€)</span><input type="number" step="0.01" id="f-amount"
-        value="${t.amount != null ? Math.abs(t.amount) : ""}" placeholder="0,00"></label>
+      <label class="f"><span>Montant (€) — négatif pour une sortie</span>
+        <div class="row tight" style="flex-wrap:nowrap">
+          <button type="button" class="sm" data-sign="-1" title="En faire une sortie">−</button>
+          <input type="number" step="0.01" id="f-amount" class="grow" style="text-align:right"
+            value="${t.amount != null ? t.amount : ""}" placeholder="0,00">
+          <button type="button" class="sm" data-sign="1" title="En faire une entrée">+</button>
+        </div></label>
+      <label class="f"><span>Nature</span>
+        <div class="row tight" style="margin-top:5px">
+          <span id="f-typelabel" class="pill">—</span>
+          <label class="inline"><input type="checkbox" id="f-internal"
+            ${t.type==="transfer"?"checked":""}> Virement interne</label>
+        </div></label>
     </div>
     <div id="f-catwrap"><label class="f"><span>Catégorie</span><select id="f-cat">
       <option value="">— non catégorisé —</option>${catOpts()}</select></label>
@@ -1895,13 +1976,12 @@ function txForm(t){
     <label class="inline"><input type="checkbox" id="f-pro" ${t.proRevenue?"checked":""}> Recette ou charge professionnelle (onglet Pro)</label>`;
 }
 function readTxForm(t){
-  const type = $("#f-type").value;
-  const amt = Math.abs(parseAmount($("#f-amount").value) || 0);
   t.date = $("#f-date").value || todayISO();
   t.accountId = $("#f-acc").value;
   t.label = $("#f-label").value.trim() || "(sans libellé)";
-  t.type = type;
-  t.amount = type === "income" ? amt : (type === "expense" ? -amt : (t.amount < 0 ? -amt : amt));
+  // le montant porte son signe ; le type s'en déduit, il ne peut pas le contredire
+  t.amount = round2(parseAmount($("#f-amount").value) || 0);
+  t.type = $("#f-internal").checked ? "transfer" : typeOf(t);
   t.categoryId = $("#f-cat") ? $("#f-cat").value : t.categoryId;
   t.counterAccountId = $("#f-counter") ? $("#f-counter").value : "";
   t.note = $("#f-note").value.trim();
@@ -1914,9 +1994,10 @@ function readTxForm(t){
 ACTIONS.newTx = () => {
   if (!S.accounts.length) return needAccount();
   const t = { id: uid("t"), date: todayISO(), accountId: activeAccounts()[0]?.id, type: "expense", amount: null };
+  // par défaut on saisit une dépense : le champ démarre donc en négatif
   modal({ title:"Nouvelle transaction", body: txForm(t),
     footer:`<button data-close>Annuler</button><button class="primary" data-act="saveNewTx">Enregistrer</button>`,
-    onOpen: hookTypeSwitch });
+    onOpen: hookAmountSign });
 };
 ACTIONS.saveNewTx = () => {
   const t = readTxForm({ id: uid("t") });
@@ -1944,7 +2025,7 @@ ACTIONS.editTx = id => {
         ${fmtDateLong((S.importBatches.find(b => b.id === t.importBatchId)?.at || "").slice(0,10))}.</p>` : ""),
     footer:`<button class="danger" data-act="delTx:${t.id}">Supprimer</button><div class="grow"></div>
             <button data-close>Annuler</button><button class="primary" data-act="saveEditTx:${t.id}">Enregistrer</button>`,
-    onOpen: hookTypeSwitch });
+    onOpen: hookAmountSign });
 };
 ACTIONS.saveEditTx = id => {
   const t = S.transactions.find(x => x.id === id); if (!t) return;
@@ -1978,17 +2059,27 @@ ACTIONS.unpair = id => {
   if (p) p.transferPeerId = null;
   t.transferPeerId = null; save(); closeModal(); render();
 };
-function hookTypeSwitch(root){
-  const sel = $("#f-type", root); if (!sel) return;
+/** L'étiquette Revenu / Dépense suit le signe saisi, sans que rien ne soit à choisir. */
+function hookAmountSign(root){
+  const amount = $("#f-amount", root), internal = $("#f-internal", root);
+  if (!amount || !internal) return;
   const upd = () => {
-    const vir = sel.value === "transfer";
+    const v = parseAmount(amount.value) || 0, vir = internal.checked;
+    const lbl = $("#f-typelabel", root);
+    lbl.textContent = vir ? (v >= 0 ? "Virement — entrée" : "Virement — sortie")
+                          : (v >= 0 ? "Revenu" : "Dépense");
+    lbl.className = "pill " + (vir ? "vir" : v >= 0 ? "rev" : "dep");
     $("#f-transferwrap", root).classList.toggle("hide", !vir);
-    // la catégorie reste accessible même pour un virement : masquer le champ
-    // rendait tout simplement impossible de catégoriser une ligne classée
-    // « virement interne » par l'import
     $("#f-cathint", root).classList.toggle("hide", !vir);
   };
-  sel.addEventListener("change", upd); upd();
+  amount.addEventListener("input", upd);
+  internal.addEventListener("change", upd);
+  $$("[data-sign]", root).forEach(btn => btn.addEventListener("click", () => {
+    const v = Math.abs(parseAmount(amount.value) || 0);
+    amount.value = +btn.dataset.sign < 0 ? -v : v;
+    upd(); amount.focus();
+  }));
+  upd();
 }
 function needAccount(){
   modal({ title:"Créer d'abord un compte",
@@ -3032,10 +3123,12 @@ VIEWS.stats = () => {
     ${a>=b?"▲":"▼"} ${pct(Math.abs((a-b)/b*100), 0)}</span>`;
   // top marchands
   const merch = new Map();
-  for (const t of txs) if (t.amount < 0 && transferCounts(t)){
+  for (const t of txs){
+    const a = countedAmount(t);
+    if (!(a < 0)) continue;
     const k = labelKey(t.label) || t.label;
     const e = merch.get(k) || { label: t.label, total: 0, n: 0 };
-    e.total += -t.amount; e.n++; merch.set(k, e);
+    e.total += -a; e.n++; merch.set(k, e);
   }
   const top = [...merch.values()].sort((a, b) => b.total - a.total).slice(0, 10);
   // heatmap annuelle
@@ -3043,7 +3136,7 @@ VIEWS.stats = () => {
   const topCats = cats.slice(0, 10);
   const matrix = topCats.map(c => yearMonths.map(m => round2(sum(
     S.transactions.filter(t => ymOf(t.date) === m && ids.includes(t.accountId)
-      && t.amount < 0 && transferCounts(t) && (t.categoryId || "__none") === c.id), t => -t.amount))));
+      && countedAmount(t) < 0 && (t.categoryId || "__none") === c.id), t => -countedAmount(t)))));
 
   return `<div class="row"><h1 style="margin:0">Statistiques <span class="muted" style="font-weight:400">— ${periodLabel()}</span></h1>
       <div class="grow"></div><button data-act="print">🖨️ Imprimer</button>
@@ -3174,7 +3267,7 @@ VIEWS.budgets = () => {
         <th class="nosort" style="min-width:140px">Avancement</th><th class="num nosort">Reste</th></tr></thead><tbody>
         ${cats.map(c => {
           const b = S.budgets[c.id] || 0;
-          const used = sum(txs.filter(t => t.categoryId === c.id && t.amount < 0 && transferCounts(t)), t => -t.amount);
+          const used = sum(txs.filter(t => t.categoryId === c.id && countedAmount(t) < 0), t => -countedAmount(t));
           const p = b ? clamp(used / b * 100, 0, 100) : 0;
           return `<tr><td><span class="chip"><i class="sw" style="background:${catColor(c.id)}"></i>${esc(catPath(c.id))}</span></td>
             <td class="num" style="max-width:130px"><input type="number" step="10" value="${b||""}" placeholder="—"
@@ -3209,8 +3302,8 @@ ACTIONS.budgetAuto = () => {
   snapshot("budgets automatiques");
   const ids = selectedAccountIds();
   for (const c of S.categories.filter(c => c.kind === "expense")){
-    const tot = sum(S.transactions.filter(t => t.categoryId === c.id && t.amount < 0
-      && transferCounts(t) && ms.includes(ymOf(t.date)) && ids.includes(t.accountId)), t => -t.amount);
+    const tot = sum(S.transactions.filter(t => t.categoryId === c.id && countedAmount(t) < 0
+      && ms.includes(ymOf(t.date)) && ids.includes(t.accountId)), t => -countedAmount(t));
     const avg = tot / ms.length;
     if (avg >= 5) S.budgets[c.id] = Math.round(avg / 5) * 5; else delete S.budgets[c.id];
   }
@@ -4639,6 +4732,7 @@ function migrate(data){
     if (!t.type) t.type = t.amount >= 0 ? "income" : "expense";
     if (!t.tags) t.tags = [];
   }
+  normalizeTypes(s.transactions);
   return s;
 }
 function demoData(){

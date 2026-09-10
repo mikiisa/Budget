@@ -24,21 +24,36 @@ Trois relevés d'exemple sont fournis pour tester l'import :
 ### Comptes et transactions
 - Plusieurs comptes, avec solde initial, couleur, archivage et **mots-clés** servant à
   reconnaître automatiquement les virements entre tes propres comptes.
-- Trois types de transaction : revenu, dépense, virement interne.
+- **Le type suit le signe** : un montant positif est un revenu, un montant négatif une dépense.
+  Rien à choisir, et aucune ligne ne peut afficher un type qui contredit son montant. Une simple
+  case « virement interne » marque en plus les mouvements entre tes propres comptes.
 - Saisie et modification manuelles, notes et tags libres.
 - Total personnalisable : tous les comptes ou seulement certains.
 - **Sélection multiple** dans la liste : une case par ligne, une case « tout » à trois états qui
   ne porte que sur le résultat filtré, **Maj+clic** pour cocher une plage entière. Une barre
   d'actions apparaît en bas avec le nombre et le total de la sélection, et permet d'affecter une
-  catégorie, changer le type, ajouter ou retirer des tags, marquer comme professionnel, ou
-  supprimer. Chaque action de masse s'annule d'un `Ctrl+Z`.
+  catégorie, corriger le sens des montants ou le marquage « virement interne », ajouter ou retirer
+  des tags, marquer comme professionnel, ou supprimer. Chaque action de masse s'annule d'un `Ctrl+Z`.
 - Un **virement interne peut recevoir une catégorie**, comme n'importe quelle autre transaction.
-  Elle sert à l'étiqueter et à le retrouver ; il n'entre dans les statistiques que si l'option
-  « virements internes » est cochée — et dans ce cas la somme du camembert par catégorie retombe
-  exactement sur le total des dépenses.
-- Les virements internes peuvent être comptés ou non dans le résultat. Entre deux comptes
-  suivis, leurs deux jambes s'annulent : le résultat ne bouge pas, ce qui est le comportement
-  correct pour un simple déplacement d'argent.
+  Un virement vers une épargne reçoit d'ailleurs automatiquement la catégorie de nature « épargne »
+  s'il n'en a pas. La somme du camembert par catégorie retombe toujours exactement sur le total des
+  dépenses.
+- **Les virements internes se comptent tout seuls**, sans réglage. Tout repose sur le
+  « périmètre dépensable » : tes comptes sélectionnés qui ne sont pas des épargnes. Une jambe de
+  virement compte si, et seulement si, son propre compte est dans ce périmètre et sa contrepartie
+  en est dehors.
+
+  | Mouvement | Effet sur le résultat |
+  | --- | --- |
+  | Compte courant → Livret A | la sortie compte, l'entrée non : de l'argent mis de côté |
+  | Compte courant → compte joint suivi | neutre, rien ne compte des deux côtés |
+  | Compte courant → compte non suivi | la sortie compte, l'argent a quitté le périmètre |
+  | Livret A → compte courant | l'entrée compte : une reprise sur l'épargne est un revenu |
+
+  Un mouvement neutre est **exclu** des deux côtés plutôt que compté deux fois : le résultat serait
+  juste dans les deux cas, mais compter les deux jambes gonflerait les totaux bruts de revenus et
+  de dépenses du même montant, faussant « quel pourcentage de mes revenus je dépense ».
+  Sur un virement ventilé, chaque destination est jugée séparément.
 
 ### Import CSV
 - Glisser-déposer, détection automatique du séparateur, de l'encodage (UTF-8 / ISO-8859-1)
