@@ -231,6 +231,7 @@ svg text.val{fill:var(--text);font-weight:600}
     <button class="tab" data-view="import">📥 <span>Import CSV</span></button>
     <button class="tab" data-view="stats">📈 <span>Statistiques</span></button>
     <button class="tab" data-view="budgets">🎯 <span>Budgets</span></button>
+    <button class="tab" data-view="savings">🐖 <span>Épargne</span></button>
     <button class="tab" data-view="pro">💼 <span>Pro</span></button>
     <button class="tab" data-view="accounts">🏦 <span>Comptes</span></button>
     <button class="tab" data-view="cats">🏷️ <span>Catégories</span></button>
@@ -458,6 +459,7 @@ const DEFAULT_BLOCKS = [
   { id:"nature",    span:4,  visible:true },
   { id:"balance",   span:6,  visible:true },
   { id:"budgets",   span:6,  visible:true },
+  { id:"savings",   span:6,  visible:true },
   { id:"recent",    span:8,  visible:true },
   { id:"review",    span:4,  visible:true },
   { id:"pro",       span:12, visible:false },
@@ -465,7 +467,8 @@ const DEFAULT_BLOCKS = [
 const BLOCK_TITLES = {
   kpi:"Chiffres clés", split:"Revenus / dépenses", cats:"Répartition par catégorie",
   months:"Évolution mensuelle", nature:"Nature des dépenses", balance:"Évolution du solde",
-  budgets:"Budgets", recent:"Dernières transactions", review:"À valider", pro:"Objectif pro",
+  budgets:"Budgets", recent:"Dernières transactions", review:"À valider",
+  savings:"Épargne", pro:"Objectif pro",
 };
 
 function freshState(){
@@ -500,6 +503,7 @@ function freshState(){
     goals: [],
     importPresets: [],
     importBatches: [],
+    splitTemplates: [],   // clés de répartition réutilisables
     savedSearches: [],
     pro: null,            // profil de l'onglet Pro, créé à la demande
     proScenarios: [],
@@ -755,7 +759,11 @@ function accountByKeyword(label, exceptId){
    vu deux fois. On les lie pour ne pas le compter deux fois.                */
 function matchTransfers({ silent = false } = {}){
   const cfg = S.settings.transferMatch;
-  const open = S.transactions.filter(t => t.type === "transfer" && !t.transferPeerId);
+  // une ligne déjà ventilée, ou déjà rattachée à une ventilation, n'est pas à apparier :
+  // sans cette garde, une jambe de répartition de 200 € serait ré-appariée en 1 pour 1
+  // avec la première autre ligne de 200 € venue.
+  const open = S.transactions.filter(t => t.type === "transfer" && !t.transferPeerId
+    && !(t.splits || []).length && !t.splitParentId);
   let n = 0;
   for (const a of open){
     if (a.transferPeerId) continue;
@@ -770,6 +778,155 @@ function matchTransfers({ silent = false } = {}){
   if (!silent) toast(n ? `${n} virement(s) interne(s) apparié(s)` : "Aucun nouveau virement à apparier");
   return n;
 }
+/* --- Répartition d'un virement (ventilation) ------------------------------
+   Depuis le compte courant part UN virement — 500 € — qui alimente plusieurs
+   épargnes : Livret A, PER, pockets. Chaque destination est un compte suivi.
+   La ligne sortante porte `splits[]` ; chaque jambe créditrice porte
+   `splitParentId`. Une jambe créée par l'application porte `generated:true` et
+   s'efface au profit de la vraie ligne quand le relevé de l'épargne est importé.
+   -------------------------------------------------------------------------- */
+const splitTotal = tx => Math.abs(tx.amount || 0);
+const isSplit = tx => !!(tx.splits || []).length;
+
+/** Convertit les lignes (€ ou %) en montants. Le résidu de centimes va sur la
+    dernière ligne : sans cela une répartition en tiers ferait dériver les soldes
+    d'un centime à chaque virement. */
+function resolveSplits(lines, total){
+  const out = lines.map(l => ({ ...l,
+    amount: round2(l.mode === "percent" ? total * (+l.value || 0) / 100 : (+l.value || 0)) }));
+  const s = round2(sum(out, l => l.amount));
+  // on ne rattrape qu'un écart d'arrondi, jamais une répartition incomplète
+  if (out.length && s !== total && Math.abs(s - total) <= 0.05 * out.length)
+    out[out.length - 1].amount = round2(out[out.length - 1].amount + (total - s));
+  return out;
+}
+/** Reste à répartir (positif = non affecté, négatif = dépassement). */
+function splitRest(lines, total){
+  return round2(total - sum(resolveSplits(lines, total), l => l.amount));
+}
+
+/** Matérialise la répartition : réutilise une ligne existante, sinon en crée une. */
+function applySplits(tx, lines){
+  const total = splitTotal(tx);
+  const cfg = S.settings.transferMatch;
+  const resolved = resolveSplits(lines, total);
+  const keep = new Set(), splits = [];
+  for (const l of resolved){
+    if (!l.accountId || !(l.amount > 0.004)) continue;
+    // 1. la jambe déjà liée à cette ligne, si elle est toujours pertinente
+    let leg = l.legId ? S.transactions.find(t => t.id === l.legId) : null;
+    if (leg && (leg.accountId !== l.accountId || leg.splitParentId !== tx.id)) leg = null;
+    // 2. sinon, une ligne libre du relevé de l'épargne, déjà importée
+    if (!leg){
+      leg = S.transactions.find(t => t.accountId === l.accountId && t.amount > 0
+        && t.id !== tx.id && !t.splitParentId && !t.transferPeerId && !keep.has(t.id)
+        && Math.abs(t.amount - l.amount) <= l.amount * cfg.amountTol + 0.01
+        && Math.abs(dayNum(t.date) - dayNum(tx.date)) <= cfg.dayTol);
+      if (leg){ leg.type = "transfer"; leg.needsReview = false; leg.reviewReason = ""; }
+    }
+    // 3. sinon on la crée : le solde de l'épargne doit être juste même sans relevé
+    if (!leg){
+      leg = { id: uid("t"), accountId: l.accountId, date: tx.date, amount: l.amount,
+              label: tx.label, rawLabel: tx.label, type: "transfer", categoryId: "",
+              tags: [], note: "", generated: true, needsReview: false,
+              importBatchId: tx.importBatchId || null };
+      S.transactions.push(leg);
+    } else if (leg.generated){
+      leg.amount = l.amount; leg.date = tx.date; leg.label = tx.label;
+    }
+    leg.splitParentId = tx.id;
+    leg.transferPeerId = null;
+    keep.add(leg.id);
+    splits.push({ accountId: l.accountId, mode: l.mode || "amount",
+                  value: +l.value || 0, amount: l.amount, legId: leg.id });
+  }
+  // les jambes qui ne servent plus sont déliées ; seules celles que l'application
+  // avait créées sont supprimées — une ligne venue d'un vrai relevé n'est jamais détruite
+  for (const t of S.transactions)
+    if (t.splitParentId === tx.id && !keep.has(t.id)) t.splitParentId = null;
+  tx.splits = splits;
+  tx.type = "transfer";
+  tx.transferPeerId = null;
+  pruneOrphanLegs();
+  return splits;
+}
+/** Retire les jambes générées devenues orphelines (parent supprimé ou répartition réduite). */
+function pruneOrphanLegs(){
+  const alive = new Set(S.transactions.map(t => t.id));
+  for (const t of S.transactions)
+    if (t.splitParentId && !alive.has(t.splitParentId)) t.splitParentId = null;
+  const before = S.transactions.length;
+  S.transactions = S.transactions.filter(t => !(t.generated && !t.splitParentId));
+  return before - S.transactions.length;
+}
+/** Annule la ventilation d'un virement. */
+function clearSplits(tx){
+  for (const t of S.transactions) if (t.splitParentId === tx.id) t.splitParentId = null;
+  tx.splits = []; delete tx.splitTemplateId;
+  pruneOrphanLegs();
+}
+const splitLegsOf = tx => (tx.splits || [])
+  .map(sp => S.transactions.find(t => t.id === sp.legId)).filter(Boolean);
+
+/** À l'import, la vraie ligne du relevé remplace la jambe que l'application avait créée. */
+function absorbGeneratedLegs(batchId){
+  const cfg = S.settings.transferMatch;
+  const fresh = S.transactions.filter(t => t.importBatchId === batchId
+    && !t.generated && !t.splitParentId);
+  let n = 0;
+  for (const imp of fresh){
+    const leg = S.transactions.find(t => t.generated && t.splitParentId
+      && t.id !== imp.id && t.accountId === imp.accountId
+      && Math.sign(t.amount) === Math.sign(imp.amount)
+      && Math.abs(Math.abs(t.amount) - Math.abs(imp.amount)) <= Math.abs(imp.amount) * cfg.amountTol + 0.01
+      && Math.abs(dayNum(t.date) - dayNum(imp.date)) <= cfg.dayTol);
+    if (!leg) continue;
+    const parent = S.transactions.find(t => t.id === leg.splitParentId);
+    imp.splitParentId = leg.splitParentId;
+    imp.type = "transfer"; imp.needsReview = false; imp.reviewReason = "";
+    if (parent) for (const sp of parent.splits || []) if (sp.legId === leg.id) sp.legId = imp.id;
+    S.transactions = S.transactions.filter(t => t.id !== leg.id);
+    n++;
+  }
+  return n;
+}
+
+/* --- Modèles de répartition ---------------------------------------------- */
+/** Le modèle qui reconnaît ce virement, s'il existe. */
+function templateFor(tx){
+  const key = labelKey(tx.label);
+  if (!key) return null;
+  return S.splitTemplates.find(t => t.auto !== false && t.matchKey === key
+    && (!t.sourceAccountId || t.sourceAccountId === tx.accountId)) || null;
+}
+/** Applique les modèles aux virements sortants d'un lot d'import.
+    Le modèle a été créé à la main par l'utilisateur pour ce libellé : il vaut
+    consentement, et la répartition part donc dès le mois suivant. Elle passe
+    quand même par la file « À valider » — sauf si le modèle a déjà été confirmé
+    une fois et que le moteur de régularité reconnaît le mouvement, auquel cas
+    redemander n'apprendrait plus rien. */
+function applyAutoSplits(batchId){
+  let n = 0;
+  for (const tx of S.transactions.filter(t => t.importBatchId === batchId
+        && t.amount < 0 && !isSplit(t) && !t.generated)){
+    const tpl = templateFor(tx);
+    if (!tpl) continue;
+    tx.type = "transfer";
+    applySplits(tx, tpl.lines.map(l => ({ ...l })));
+    tx.splitTemplateId = tpl.id;
+    const etabli = (tpl.hits || 0) >= 1 && isKnownRegular(tx);
+    if (etabli){
+      tx.needsReview = false; tx.reviewReason = "";
+      tpl.hits = (tpl.hits || 0) + 1;
+    } else {
+      tx.needsReview = true;
+      tx.reviewReason = `Répartition « ${tpl.name} » appliquée automatiquement — à confirmer`;
+    }
+    n++;
+  }
+  return n;
+}
+
 /** Classement automatique à l'import : type, catégorie, mise en file d'attente. */
 function autoClassify(tx){
   const kwAcc = accountByKeyword(tx.label, tx.accountId);
@@ -1047,12 +1204,24 @@ function byAxis(txs, axis){
 /** Solde d'un compte à une date donnée (ou aujourd'hui). */
 function accountBalance(id, upTo){
   const a = accById(id); if (!a) return 0;
-  return (a.initialBalance || 0) + sum(S.transactions.filter(t =>
-    t.accountId === id && (!upTo || t.date <= upTo)), t => t.amount);
+  // arrondi au centime : sans lui, additionner des centaines de montants décimaux
+  // fait apparaître des soldes du genre 233,32999999999998 dans les exports
+  return round2((a.initialBalance || 0) + sum(S.transactions.filter(t =>
+    t.accountId === id && (!upTo || t.date <= upTo)), t => t.amount));
 }
+/* --- Épargne -------------------------------------------------------------- */
+const savingsAccounts = () => S.accounts.filter(a => a.savings && !a.archived);
+const savingsTotal = upTo => round2(sum(savingsAccounts(), a => accountBalance(a.id, upTo)));
+/** Ce qui est réellement entré sur les épargnes pendant la période. */
+function savingsInflow(txs){
+  const ids = new Set(savingsAccounts().map(a => a.id));
+  return sum(txs.filter(t => ids.has(t.accountId) && t.amount > 0), t => t.amount);
+}
+/** Les virements ventilés, du plus récent au plus ancien. */
+const splitHistory = () => S.transactions.filter(isSplit).sort((a, b) => a.date < b.date ? 1 : -1);
+
 /** Série mensuelle des soldes cumulés des comptes sélectionnés. */
-function balanceSeries(months){
-  const ids = selectedAccountIds();
+function balanceSeries(months, ids = selectedAccountIds()){
   const base = sum(ids, id => accById(id)?.initialBalance || 0);
   return months.map(ym => {
     const end = lastDayOf(ym);
@@ -1321,6 +1490,21 @@ function dashBlock(id, txs, T){
       return `<p style="margin:0 0 10px"><b>${n}</b> transaction(s) attendent une précision de ta part.</p>
         <button class="primary" data-act="goto:review">Traiter maintenant</button>`;
     }
+    case "savings": {
+      const accs = savingsAccounts();
+      if (!accs.length) return `<p class="muted">Aucun compte marqué comme épargne.
+        <a href="#accounts" data-act="goto:accounts">En désigner un</a>.</p>`;
+      const total = savingsTotal(), inflow = savingsInflow(periodTx({ allAccounts:true }));
+      const d = accs.map((a, i) => ({ label:a.name, value: Math.max(0, accountBalance(a.id)),
+        color: a.color || paletteColor(i) })).filter(x => x.value > 0);
+      return `<div class="row tight" style="margin-bottom:10px">
+          <div class="stat grow"><div class="k">Total épargné</div><div class="v">${money(total)}</div></div>
+          <div class="stat grow"><div class="k">Versé sur la période</div>
+            <div class="v pos">${money(inflow)}</div></div>
+        </div>
+        ${stackBar(d)}${legend(d)}
+        <button class="sm" style="margin-top:10px" data-act="goto:savings">Voir le détail</button>`;
+    }
     case "pro": {
       if (!S.pro) return `<p class="muted">Aucun profil professionnel. <a href="#pro" data-act="goto:pro">Configurer l'onglet Pro</a>.</p>`;
       const res = solveForNet(S.pro);
@@ -1390,7 +1574,12 @@ let SORT = { key:"date", dir:-1 };
 const TX_COLS = {
   date:{ label:"Date", get:t => fmtDate(t.date), sort:t => t.date },
   account:{ label:"Compte", get:t => esc(accById(t.accountId)?.name || "—"), sort:t => accById(t.accountId)?.name || "" },
-  label:{ label:"Libellé", get:t => esc(t.label) + (t.autoCategorized ? ` <span class="muted" title="Classée automatiquement">⚡</span>` : ""), sort:t => t.label },
+  label:{ label:"Libellé", sort:t => t.label,
+    get:t => esc(t.label)
+      + (t.autoCategorized ? ` <span class="muted" title="Classée automatiquement">⚡</span>` : "")
+      + (isSplit(t) ? ` <span class="pill vir" title="${esc((t.splits||[]).map(sp =>
+          `${accById(sp.accountId)?.name || "?"} ${money(sp.amount)}`).join(" · "))}">⑂ réparti</span>` : "")
+      + (t.splitParentId ? ` <span class="pill vir" title="Jambe d'une répartition${t.generated ? " — ligne créée par l'application" : ""}">⑂</span>` : "") },
   category:{ label:"Catégorie", sort:t => catPath(t.categoryId),
     get:t => t.categoryId ? `<span class="chip"><i class="sw" style="background:${catColor(t.categoryId)}"></i>${esc(catPath(t.categoryId))}</span>`
                           : `<span class="muted">—</span>` },
@@ -1566,7 +1755,15 @@ ACTIONS.saveNewTx = () => {
 ACTIONS.editTx = id => {
   const t = S.transactions.find(x => x.id === id); if (!t) return;
   const peer = t.transferPeerId && S.transactions.find(x => x.id === t.transferPeerId);
-  modal({ title:"Modifier la transaction", body: txForm(t) +
+  const splitBox = t.type === "transfer" && t.amount < 0
+    ? `<fieldset><legend>Répartition</legend>
+        ${isSplit(t) ? splitSummary(t) : `<p class="muted" style="margin:0">Ce virement part en un seul bloc.
+          Répartis-le si l'argent est ensuite ventilé entre plusieurs épargnes.</p>`}
+        <button class="${isSplit(t) ? "" : "primary"}" style="margin-top:10px"
+          data-act="openSplit:${t.id}">⑂ ${isSplit(t) ? "Modifier la répartition" : "Répartir sur plusieurs comptes"}</button>
+      </fieldset>`
+    : "";
+  modal({ title:"Modifier la transaction", body: txForm(t) + splitBox +
       (peer ? `<div class="note info">Appariée avec « ${esc(peer.label)} » du ${fmtDate(peer.date)}
         sur ${esc(accById(peer.accountId)?.name || "?")}. <a href="#" data-act="unpair:${t.id}">Défaire l'appariement</a></div>` : "") +
       (t.importBatchId ? `<p class="muted" style="margin:0;font-size:.85em">Issue de l'import du
@@ -1577,9 +1774,15 @@ ACTIONS.editTx = id => {
 };
 ACTIONS.saveEditTx = id => {
   const t = S.transactions.find(x => x.id === id); if (!t) return;
-  const before = t.categoryId, label = t.label;
+  const before = t.categoryId, label = t.label, amountBefore = t.amount;
   snapshot("modification de transaction");
   readTxForm(t);
+  // le total a changé ou ce n'est plus un virement : la ventilation ne colle plus
+  if (isSplit(t)){
+    if (t.type !== "transfer") clearSplits(t);
+    else if (Math.abs(t.amount - amountBefore) > 0.004)
+      applySplits(t, t.splits.map(sp => ({ ...sp })));
+  }
   save(); closeModal(); render();
   if (t.categoryId && t.categoryId !== before) proposeRule(label || t.label, t.categoryId);
 };
@@ -1588,7 +1791,11 @@ ACTIONS.delTx = id => {
   if (!confirm(`Supprimer « ${t.label} » du ${fmtDate(t.date)} ?`)) return;
   snapshot("suppression de transaction");
   if (t.transferPeerId){ const p = S.transactions.find(x => x.id === t.transferPeerId); if (p) p.transferPeerId = null; }
+  // les jambes créées par sa répartition partent avec lui ; celles venues d'un
+  // relevé restent, simplement libérées
+  if (isSplit(t)) clearSplits(t);
   S.transactions = S.transactions.filter(x => x.id !== id);
+  pruneOrphanLegs();
   save(); closeModal(); render(); toast("Supprimée — Ctrl+Z pour annuler");
 };
 ACTIONS.unpair = id => {
@@ -1611,6 +1818,192 @@ function needAccount(){
     footer:`<button data-close>Plus tard</button><button class="primary" data-act="goAccounts">Créer un compte</button>` });
 }
 ACTIONS.goAccounts = () => { closeModal(); go("accounts"); };
+
+/* --- Éditeur de répartition ---------------------------------------------- */
+let SPLIT = null;   // { txId, lines:[{accountId, mode, value, legId}] }
+
+ACTIONS.openSplit = id => {
+  const tx = S.transactions.find(t => t.id === id);
+  if (!tx) return;
+  if (tx.amount >= 0) return toast("La répartition s'applique au virement sortant");
+  if (activeAccounts().length < 2) return toast("Il faut au moins deux comptes");
+  SPLIT = { txId: id, lines: isSplit(tx)
+    ? tx.splits.map(sp => ({ accountId: sp.accountId, mode: sp.mode, value: sp.value, legId: sp.legId }))
+    : suggestLines(tx) };
+  openSplitModal();
+};
+/** Première proposition : les comptes d'épargne, à parts égales. */
+function suggestLines(tx){
+  const dests = (savingsAccounts().length ? savingsAccounts() : activeAccounts())
+    .filter(a => a.id !== tx.accountId).slice(0, 3);
+  if (!dests.length) return [];
+  const part = round2(100 / dests.length);
+  return dests.map(a => ({ accountId: a.id, mode: "percent", value: part }));
+}
+function openSplitModal(){
+  const tx = S.transactions.find(t => t.id === SPLIT.txId);
+  modal({ title: "Répartir ce virement", wide: true, body: splitBody(tx),
+    footer: `<button class="danger" data-act="splitClear">Supprimer la répartition</button>
+      <div class="grow"></div><button data-close>Annuler</button>
+      <button class="primary" data-act="splitSave">Enregistrer</button>` });
+}
+function splitBody(tx){
+  const total = splitTotal(tx);
+  const dests = activeAccounts().filter(a => a.id !== tx.accountId);
+  const resolved = resolveSplits(SPLIT.lines, total);
+  const rest = splitRest(SPLIT.lines, total);
+  return `<div class="note info" style="margin:0">
+      <b>${money(total)}</b> partis de ${esc(accById(tx.accountId)?.name || "?")} le ${fmtDate(tx.date)}
+      — « ${esc(tx.label)} ». Répartis ce montant entre tes épargnes.
+    </div>
+    ${S.splitTemplates.length ? `<div class="row tight">
+      <span class="muted">Modèle :</span>
+      ${S.splitTemplates.map(t => `<button class="sm" data-act="splitUseTpl:${t.id}">${esc(t.name)}</button>`).join("")}
+    </div>` : ""}
+    <div class="tablewrap"><table><thead><tr>
+      <th class="nosort">Destination</th><th class="nosort" style="width:120px">Mode</th>
+      <th class="num nosort" style="width:130px">Valeur</th>
+      <th class="num nosort" style="width:120px">Montant</th><th class="nosort"></th></tr></thead>
+    <tbody>
+      ${SPLIT.lines.map((l, i) => `<tr>
+        <td><select data-act="splitAcc:${i}">
+          <option value="">— choisir un compte —</option>
+          ${dests.map(a => `<option value="${a.id}" ${l.accountId===a.id?"selected":""}>${esc(a.name)}${a.savings?" · épargne":""}</option>`).join("")}
+        </select></td>
+        <td><select data-act="splitMode:${i}">
+          <option value="amount"  ${l.mode!=="percent"?"selected":""}>€</option>
+          <option value="percent" ${l.mode==="percent"?"selected":""}>%</option></select></td>
+        <td class="num"><input type="number" step="0.01" value="${l.value}" data-act="splitVal:${i}"
+          data-on="input" style="text-align:right"></td>
+        <td class="num sp-amount" data-i="${i}">${money(resolved[i]?.amount || 0)}</td>
+        <td><button class="ghost sm" data-act="splitDel:${i}">🗑</button></td></tr>`).join("")}
+    </tbody></table></div>
+    <div class="row tight">
+      <button class="sm" data-act="splitAdd">+ Destination</button>
+      <button class="sm" data-act="splitEven">Répartir également</button>
+      <button class="sm" data-act="splitRestToLast">Mettre le reste sur la dernière ligne</button>
+      <div class="grow"></div>
+      <div id="sp-rest" class="${rest === 0 ? "pill ok" : "pill dep"}" style="padding:5px 12px">
+        ${restLabel(rest)}</div>
+    </div>
+    <fieldset><legend>Mémoriser</legend>
+      <div class="row tight">
+        <label class="f grow" style="max-width:280px"><span>Enregistrer comme modèle</span>
+          <input id="sp-tplname" placeholder="Ex. Virement épargne mensuel"
+            value="${esc(S.splitTemplates.find(t => t.id === tx.splitTemplateId)?.name || "")}"></label>
+        <label class="inline" style="margin-top:16px"><input type="checkbox" id="sp-tplauto" checked>
+          l'appliquer aux prochains virements identiques</label>
+      </div>
+      <p class="muted" style="margin:8px 0 0;font-size:.88em">Le modèle se reconnaît au libellé
+        « ${esc(labelKey(tx.label) || tx.label)} » depuis ce compte. À l'import du mois suivant, la
+        répartition est appliquée et te sera présentée pour confirmation.</p>
+    </fieldset>
+    <p class="muted" style="margin:0;font-size:.88em">Pour chaque destination, l'application
+      utilise la ligne du relevé si elle existe déjà, sinon elle la crée. Si tu importes le relevé
+      de l'épargne plus tard, la vraie ligne remplacera celle qui avait été créée.</p>`;
+}
+const restLabel = r => r === 0 ? "Réparti intégralement"
+  : r > 0 ? `Reste à répartir : ${money(r)}` : `Dépassement de ${money(-r)}`;
+
+/** Met à jour les montants et le reste sans reconstruire la modale : on ne veut
+    pas perdre le curseur pendant la saisie. */
+function refreshSplitTotals(){
+  const tx = S.transactions.find(t => t.id === SPLIT.txId); if (!tx) return;
+  const total = splitTotal(tx);
+  const resolved = resolveSplits(SPLIT.lines, total);
+  $$(".sp-amount").forEach(td => { td.textContent = money(resolved[+td.dataset.i]?.amount || 0); });
+  const rest = splitRest(SPLIT.lines, total), el = $("#sp-rest");
+  if (el){ el.textContent = restLabel(rest); el.className = rest === 0 ? "pill ok" : "pill dep"; }
+}
+ACTIONS.splitAcc  = (i, el) => { SPLIT.lines[i].accountId = el.value; SPLIT.lines[i].legId = null; };
+ACTIONS.splitMode = (i, el) => {
+  const tx = S.transactions.find(t => t.id === SPLIT.txId), total = splitTotal(tx);
+  const l = SPLIT.lines[i], cur = resolveSplits(SPLIT.lines, total)[i].amount;
+  l.mode = el.value;
+  // on convertit la valeur pour que le montant ne bouge pas en changeant d'unité
+  l.value = l.mode === "percent" ? (total ? round2(cur / total * 100) : 0) : cur;
+  openSplitModal();
+};
+ACTIONS.splitVal = (i, el) => { SPLIT.lines[i].value = +el.value || 0; refreshSplitTotals(); };
+ACTIONS.splitAdd = () => { SPLIT.lines.push({ accountId:"", mode:"amount", value:0 }); openSplitModal(); };
+ACTIONS.splitDel = i => { SPLIT.lines.splice(+i, 1); openSplitModal(); };
+ACTIONS.splitEven = () => {
+  const tx = S.transactions.find(t => t.id === SPLIT.txId), total = splitTotal(tx);
+  const n = SPLIT.lines.length; if (!n) return;
+  // en euros plutôt qu'en pourcentages : 300 € en trois donne 100 / 100 / 100,
+  // là où 33,33 % chacun donnerait 99,99 / 99,99 / 100,02
+  const part = round2(total / n);
+  SPLIT.lines.forEach((l, i) => {
+    l.mode = "amount";
+    l.value = i === n - 1 ? round2(total - part * (n - 1)) : part;
+  });
+  openSplitModal();
+};
+ACTIONS.splitRestToLast = () => {
+  const tx = S.transactions.find(t => t.id === SPLIT.txId), total = splitTotal(tx);
+  const n = SPLIT.lines.length; if (!n) return;
+  const others = sum(resolveSplits(SPLIT.lines, total).slice(0, n - 1), l => l.amount);
+  const last = SPLIT.lines[n - 1];
+  last.mode = "amount"; last.value = round2(total - others);
+  openSplitModal();
+};
+ACTIONS.splitUseTpl = id => {
+  const tpl = S.splitTemplates.find(t => t.id === id); if (!tpl) return;
+  SPLIT.lines = tpl.lines.map(l => ({ ...l }));
+  openSplitModal();
+};
+ACTIONS.splitClear = () => {
+  const tx = S.transactions.find(t => t.id === SPLIT.txId); if (!tx) return;
+  snapshot("suppression de répartition");
+  clearSplits(tx); save(); closeModal(); render(); toast("Répartition supprimée");
+};
+ACTIONS.splitSave = () => {
+  const tx = S.transactions.find(t => t.id === SPLIT.txId); if (!tx) return;
+  const total = splitTotal(tx);
+  const lines = SPLIT.lines.filter(l => l.accountId);
+  if (!lines.length) return toast("Choisis au moins une destination");
+  if (new Set(lines.map(l => l.accountId)).size !== lines.length)
+    return toast("Un même compte apparaît deux fois");
+  const rest = splitRest(lines, total);
+  if (rest !== 0) return toast(rest > 0
+    ? `Il reste ${money(rest)} à répartir` : `Tu dépasses de ${money(-rest)}`);
+  const name = $("#sp-tplname")?.value.trim();
+  snapshot("répartition");
+  applySplits(tx, lines);
+  tx.needsReview = false; tx.reviewReason = "";
+  if (name){
+    const existing = S.splitTemplates.find(t => t.name === name)
+      || S.splitTemplates.find(t => t.id === tx.splitTemplateId);
+    const tpl = existing || { id: uid("st"), hits: 0 };
+    Object.assign(tpl, { name, sourceAccountId: tx.accountId, matchKey: labelKey(tx.label),
+      auto: !!$("#sp-tplauto")?.checked,
+      lines: lines.map(l => ({ accountId: l.accountId, mode: l.mode || "amount", value: +l.value || 0 })) });
+    tpl.hits = (tpl.hits || 0) + 1;
+    if (!existing) S.splitTemplates.push(tpl);
+    tx.splitTemplateId = tpl.id;
+  }
+  save(); closeModal(); render();
+  toast(`Réparti sur ${lines.length} compte(s)`);
+};
+/** Résumé lisible d'une ventilation, réutilisé dans plusieurs vues. */
+function splitSummary(tx, { compact = false } = {}){
+  const rows = (tx.splits || []).map(sp => {
+    const leg = S.transactions.find(t => t.id === sp.legId);
+    return `<div class="row tight" style="justify-content:space-between;gap:8px">
+      <span class="chip"><i class="sw" style="background:${accById(sp.accountId)?.color || "var(--c1)"}"></i>
+        ${esc(accById(sp.accountId)?.name || "compte supprimé")}</span>
+      <span style="font-variant-numeric:tabular-nums">${money(sp.amount)}
+        <span class="muted">${sp.mode === "percent" ? `(${pct(sp.value, 0)})` : ""}</span>
+        ${leg && leg.generated ? `<span class="pill warn" title="Ligne créée par la répartition, en attente du relevé">créée</span>`
+          : `<span class="pill ok" title="Ligne présente sur le relevé du compte">relevé</span>`}</span></div>`;
+  }).join("");
+  const s = sum(tx.splits || [], sp => sp.amount);
+  const ecart = round2(splitTotal(tx) - s);
+  return rows + (ecart !== 0 ? `<div class="note bad" style="margin-top:6px">Répartition incomplète :
+    ${money(Math.abs(ecart))} ${ecart > 0 ? "non affectés" : "en trop"}.</div>` : "")
+    + (compact ? "" : `<p class="muted" style="margin:6px 0 0;font-size:.86em">Total réparti ${money(s)}
+      sur ${money(splitTotal(tx))}.</p>`);
+}
 
 /* --- Apprentissage : proposer une règle après une recatégorisation -------- */
 function proposeRule(label, categoryId){
@@ -1656,14 +2049,20 @@ VIEWS.review = () => {
             · <span class="${t.amount<0?"neg":"pos"}">${money(t.amount, true)}</span></div>
           ${t.reviewReason ? `<div class="pill warn" style="margin-top:5px">${esc(t.reviewReason)}</div>` : ""}
         </div>
+        ${isSplit(t) ? `<div class="grow" style="min-width:230px">${splitSummary(t, { compact:true })}</div>
+        <div class="stack" style="gap:5px">
+          <button class="sm primary" data-act="reviewSplitOk:${t.id}">Confirmer la répartition</button>
+          <button class="sm" data-act="openSplit:${t.id}">Modifier la répartition</button>
+        </div>` : `
         <label class="f" style="max-width:230px"><span>Classer en</span>
           <select data-act="reviewCat:${t.id}"><option value="">— choisir —</option>
             ${cats.map(c => `<option value="${c.id}">${esc(catPath(c.id))}</option>`).join("")}</select></label>
         <div class="stack" style="gap:5px">
           <button class="sm" data-act="reviewTransfer:${t.id}">C'est un virement interne</button>
+          <button class="sm" data-act="openSplit:${t.id}">⑂ Répartir</button>
           <button class="sm ghost" data-act="editTx:${t.id}">Ouvrir en détail</button>
           <button class="sm ghost" data-act="reviewSkip:${t.id}">Laisser sans catégorie</button>
-        </div></div></div>`).join("")}</div>
+        </div>`}</div></div>`).join("")}</div>
     ${list.length > 60 ? `<p class="muted">… et ${list.length - 60} autre(s). Traite celles-ci d'abord.</p>` : ""}`;
 };
 ACTIONS.reviewCat = (id, el) => {
@@ -1677,6 +2076,13 @@ ACTIONS.reviewTransfer = id => {
   snapshot("validation");
   t.type = "transfer"; t.needsReview = false; t.reviewReason = ""; t.categoryId = "";
   matchTransfers({ silent:true }); save(); render();
+};
+ACTIONS.reviewSplitOk = id => {
+  const t = S.transactions.find(x => x.id === id); if (!t) return;
+  t.needsReview = false; t.reviewReason = "";
+  const tpl = S.splitTemplates.find(x => x.id === t.splitTemplateId);
+  if (tpl) tpl.hits = (tpl.hits || 0) + 1;   // confirmé une fois : le modèle devient silencieux
+  save(); render(); toast("Répartition confirmée");
 };
 ACTIONS.reviewSkip = id => {
   const t = S.transactions.find(x => x.id === id);
@@ -1715,7 +2121,8 @@ VIEWS.accounts = () => {
     return `<tr ${a.archived?'style="opacity:.55"':""}>
       <td><span class="chip"><i class="sw" style="background:${a.color||"var(--c1)"}"></i>${esc(a.name)}</span>
         ${a.archived?'<span class="pill warn">archivé</span>':""}</td>
-      <td>${esc(a.type || "—")}</td>
+      <td>${esc(a.type || "—")}${a.savings ? ` <span class="pill ok">épargne</span>` : ""}
+        ${a.savingsGroup ? `<span class="chip">${esc(a.savingsGroup)}</span>` : ""}</td>
       <td class="num">${money(a.initialBalance || 0)}</td>
       <td class="num"><b>${money(accountBalance(a.id))}</b></td>
       <td class="num">${n}</td>
@@ -1769,7 +2176,23 @@ function accForm(a){
   <label class="f"><span>Mots-clés de reconnaissance (séparés par des virgules)</span>
     <input id="a-kw" value="${esc((a.keywords||[]).join(", "))}" placeholder="LIVRET A, VIR LIVRET, EPARGNE"></label>
   <p class="muted" style="margin:0;font-size:.88em">Astuce : reprends le libellé tel qu'il apparaît sur ton relevé
-    quand tu transfères de l'argent vers ce compte.</p>`;
+    quand tu transfères de l'argent vers ce compte.</p>
+  <fieldset><legend>Épargne</legend>
+    <label class="inline"><input type="checkbox" id="a-savings" ${a.savings?"checked":""}>
+      C'est une épargne (Livret, PER, pocket…)</label>
+    <div class="grid2" style="margin-top:10px">
+      <label class="f"><span>Groupe</span>
+        <input id="a-group" list="a-groups" value="${esc(a.savingsGroup||"")}" placeholder="Précaution, Retraite, Projets…">
+        <datalist id="a-groups">${[...new Set(S.accounts.map(x => x.savingsGroup).filter(Boolean))]
+          .map(g => `<option>${esc(g)}</option>`).join("")}</datalist></label>
+      <label class="f"><span>Objectif (€, 0 = aucun)</span>
+        <input type="number" step="100" id="a-goal" value="${a.goal?.target||0}"></label>
+      <label class="f"><span>Échéance (facultatif)</span>
+        <input type="date" id="a-goal-due" value="${a.goal?.due||""}"></label>
+    </div>
+    <p class="muted" style="margin:8px 0 0;font-size:.88em">Un objectif porté par le compte se remplit
+      tout seul depuis son solde : rien à ressaisir chaque mois.</p>
+  </fieldset>`;
 }
 ACTIONS.newAcc = () => modal({ title:"Nouveau compte", body: accForm({}),
   footer:`<button data-close>Annuler</button><button class="primary" data-act="saveAcc:">Créer</button>` });
@@ -1779,8 +2202,11 @@ ACTIONS.saveAcc = id => {
   const name = $("#a-name").value.trim();
   if (!name) return toast("Donne un nom au compte");
   snapshot("compte");
+  const goalTarget = +$("#a-goal").value || 0;
   const data = { name, type: $("#a-type").value, initialBalance: parseAmount($("#a-init").value) || 0,
-    color: $("#a-color").value, keywords: $("#a-kw").value.split(",").map(s => s.trim()).filter(Boolean) };
+    color: $("#a-color").value, keywords: $("#a-kw").value.split(",").map(s => s.trim()).filter(Boolean),
+    savings: $("#a-savings").checked, savingsGroup: $("#a-group").value.trim(),
+    goal: goalTarget > 0 ? { target: goalTarget, due: $("#a-goal-due").value } : null };
   if (id){ Object.assign(accById(id), data); }
   else { S.accounts.push({ id: uid("a"), archived: false, ...data }); }
   save(); closeModal(); render(); toast("Compte enregistré");
@@ -2385,20 +2811,30 @@ ACTIONS.impRun = () => {
     autoClassify(t);
     S.transactions.push(t);
   }
+  // la vraie ligne du relevé prend la place de celle que la répartition avait créée
+  const absorbed = absorbGeneratedLegs(batch.id);
   const paired = matchTransfers({ silent: true });
+  const split = applyAutoSplits(batch.id);
   const review = S.transactions.filter(t => t.importBatchId === batch.id && t.needsReview).length;
   IMP = null; save(); go("tx");
-  toast(`${list.length} ligne(s) importée(s)${paired ? `, ${paired} virement(s) apparié(s)` : ""}${review ? ` — ${review} à valider` : ""}`);
+  toast(`${list.length} ligne(s) importée(s)${paired ? `, ${paired} virement(s) apparié(s)` : ""}`
+    + `${absorbed ? `, ${absorbed} jambe(s) de répartition retrouvée(s)` : ""}`
+    + `${split ? `, ${split} répartition(s) appliquée(s)` : ""}`
+    + `${review ? ` — ${review} à valider` : ""}`);
   if (review) setTimeout(() => go("review"), 900);
 };
 ACTIONS.undoBatch = id => {
   const n = S.transactions.filter(t => t.importBatchId === id).length;
   if (!confirm(`Retirer les ${n} transaction(s) de cet import ?`)) return;
   snapshot("annulation d'import");
-  for (const t of S.transactions) if (t.importBatchId === id && t.transferPeerId){
-    const p = S.transactions.find(x => x.id === t.transferPeerId); if (p) p.transferPeerId = null;
+  for (const t of S.transactions) if (t.importBatchId === id){
+    if (t.transferPeerId){
+      const p = S.transactions.find(x => x.id === t.transferPeerId); if (p) p.transferPeerId = null;
+    }
+    if (isSplit(t)) clearSplits(t);
   }
   S.transactions = S.transactions.filter(t => t.importBatchId !== id);
+  pruneOrphanLegs();
   save(); render(); toast(`${n} ligne(s) retirée(s)`);
 };
 
@@ -2913,6 +3349,150 @@ function breakEvenCharges(profile, ca){
   }
   return round2(lo);
 }
+
+/* --- Vue : épargne ------------------------------------------------------- */
+VIEWS.savings = () => {
+  const accs = savingsAccounts();
+  if (!accs.length) return `<h1>Épargne</h1>
+    <div class="card"><p style="margin:0 0 10px">Aucun compte n'est marqué comme épargne.</p>
+      <p class="muted">Ouvre l'onglet <a href="#accounts" data-act="goto:accounts">Comptes</a>, modifie
+        ton Livret A, ton PER ou tes pockets, et coche « c'est une épargne ». Ils apparaîtront ici avec
+        leur solde, leur part du total et leur objectif.</p>
+      <button class="primary" data-act="goto:accounts">Aller aux comptes</button></div>`;
+
+  const txs = periodTx({ allAccounts: true });
+  const T = totals(periodTx());
+  const total = savingsTotal();
+  const inflow = savingsInflow(txs);
+  const outflow = sum(txs.filter(t => accs.some(a => a.id === t.accountId) && t.amount < 0), t => -t.amount);
+  const effort = T.income ? inflow / T.income * 100 : 0;
+  const withGoal = accs.filter(a => a.goal?.target > 0);
+  const goalTarget = sum(withGoal, a => a.goal.target);
+  const goalNow = sum(withGoal, a => accountBalance(a.id));
+
+  const byAcc = accs.map((a, i) => ({ label:a.name, value: Math.max(0, accountBalance(a.id)),
+                                      color: a.color || paletteColor(i) }))
+                    .filter(d => d.value > 0).sort((x, y) => y.value - x.value);
+  const groups = new Map();
+  for (const a of accs){
+    const g = a.savingsGroup || "Sans groupe";
+    groups.set(g, (groups.get(g) || 0) + Math.max(0, accountBalance(a.id)));
+  }
+  const byGroup = [...groups].map(([label, value], i) => ({ label, value, color: paletteColor(i) }))
+                             .filter(d => d.value > 0).sort((x, y) => y.value - x.value);
+  const months = recentMonths(18);
+  const hist = splitHistory();
+
+  return `<div class="row"><h1 style="margin:0">Épargne <span class="muted" style="font-weight:400">— ${periodLabel()}</span></h1>
+      <div class="grow"></div>
+      <button data-act="goto:accounts">Gérer les comptes</button>
+      <button data-act="print">🖨️ Imprimer</button></div>
+    ${periodPicker()}
+    <div class="grid3" style="margin:14px 0">
+      <div class="stat"><div class="k">Total épargné</div><div class="v">${money(total)}</div>
+        <div class="s">${accs.length} compte(s)</div></div>
+      <div class="stat"><div class="k">Versé sur la période</div><div class="v pos">${money(inflow)}</div>
+        <div class="s">${outflow ? `${money(outflow)} retirés` : "aucun retrait"}</div></div>
+      <div class="stat"><div class="k">Effort d'épargne</div><div class="v">${pct(effort)}</div>
+        <div class="s">des revenus de la période</div></div>
+      ${goalTarget ? `<div class="stat"><div class="k">Objectifs</div>
+        <div class="v">${pct(goalTarget ? goalNow/goalTarget*100 : 0)}</div>
+        <div class="s">${money(goalNow)} sur ${money(goalTarget)}</div></div>`
+      : `<div class="stat"><div class="k">Net épargné</div>
+        <div class="v ${inflow-outflow>=0?"pos":"neg"}">${money(inflow-outflow, true)}</div>
+        <div class="s">sur la période</div></div>`}
+    </div>
+
+    <div class="dash">
+      <section class="card blk" data-span="6"><h3>Répartition par compte</h3>
+        ${donut(byAcc, { center: money(total, false, 0) })}${legend(byAcc)}
+      </section>
+      ${byGroup.length > 1 ? `<section class="card blk" data-span="6"><h3>Répartition par groupe</h3>
+        ${donut(byGroup, { center: money(total, false, 0) })}${legend(byGroup)}
+      </section>` : `<section class="card blk" data-span="6"><h3>Groupes</h3>
+        <p class="muted">Donne un groupe à tes épargnes (Précaution, Retraite, Projets…) dans l'onglet
+          Comptes pour voir ici comment ton patrimoine se répartit par destination.</p></section>`}
+
+      <section class="card blk" data-span="12"><h3>Mes épargnes</h3>
+        <div class="tablewrap"><table><thead><tr>
+          <th class="nosort">Compte</th><th class="nosort">Groupe</th>
+          <th class="num nosort">Solde</th><th class="num nosort">Part</th>
+          <th class="num nosort">Versé sur la période</th>
+          <th class="nosort" style="min-width:150px">Objectif</th>
+          <th class="nosort"></th></tr></thead><tbody>
+          ${accs.map(a => {
+            const bal = accountBalance(a.id);
+            const inA = sum(txs.filter(t => t.accountId === a.id && t.amount > 0), t => t.amount);
+            const g = a.goal;
+            const p = g?.target ? clamp(bal / g.target * 100, 0, 100) : 0;
+            const left = g?.target ? Math.max(0, g.target - bal) : 0;
+            const ml = g?.due ? monthsLeft(g.due) : 0;
+            return `<tr>
+              <td><span class="chip"><i class="sw" style="background:${a.color||"var(--c2)"}"></i>${esc(a.name)}</span></td>
+              <td class="muted">${esc(a.savingsGroup || "—")}</td>
+              <td class="num"><b>${money(bal)}</b></td>
+              <td class="num muted">${pct(total ? bal/total*100 : 0, 0)}</td>
+              <td class="num ${inA?"pos":""}">${inA ? money(inA) : "—"}</td>
+              <td>${g?.target ? `<div class="bar"><i style="width:${p}%;background:${p>=100?"var(--pos)":"var(--accent)"}"></i></div>
+                    <small class="muted">${money(bal,false,0)} / ${money(g.target,false,0)}${
+                      left && ml ? ` · ${money(left/ml)} par mois pendant ${ml} mois` : left ? "" : " · atteint"}</small>`
+                  : `<span class="muted">—</span>`}</td>
+              <td><button class="ghost sm" data-act="editAcc:${a.id}">✎</button></td></tr>`;
+          }).join("")}
+          <tr><td><b>Total</b></td><td></td><td class="num"><b>${money(total)}</b></td>
+            <td class="num">100 %</td><td class="num pos"><b>${money(inflow)}</b></td><td></td><td></td></tr>
+        </tbody></table></div>
+      </section>
+
+      <section class="card blk" data-span="12"><h3>Évolution du total épargné</h3>
+        ${lineChart(balanceSeries(months, accs.map(a => a.id)), { h:220, color:"var(--pos)" })}
+      </section>
+
+      <section class="card blk" data-span="12"><h3>Répartitions de virements</h3>
+        ${hist.length ? `<div class="stack">${hist.slice(0, 12).map(t => `
+            <div style="border:1px solid var(--border);border-radius:var(--radius);padding:12px">
+              <div class="row tight" style="justify-content:space-between">
+                <div><b>${money(splitTotal(t))}</b> <span class="muted">depuis
+                  ${esc(accById(t.accountId)?.name || "?")} · ${fmtDate(t.date)}</span>
+                  ${t.needsReview ? `<span class="pill warn">à confirmer</span>` : ""}</div>
+                <div><button class="sm" data-act="openSplit:${t.id}">Modifier</button></div>
+              </div>
+              <div style="margin-top:8px">${splitSummary(t, { compact:true })}</div>
+            </div>`).join("")}</div>
+          ${hist.length > 12 ? `<p class="muted" style="margin:10px 0 0">… ${hist.length - 12} autre(s).</p>` : ""}`
+        : `<p class="muted">Aucun virement réparti pour l'instant. Ouvre un virement sortant dans
+             l'onglet Transactions et clique « Répartir sur plusieurs comptes » : son montant sera
+             ventilé entre tes épargnes, et l'application créera les lignes manquantes.</p>`}
+      </section>
+
+      ${S.splitTemplates.length ? `<section class="card blk" data-span="12"><h3>Modèles de répartition</h3>
+        <div class="tablewrap"><table><thead><tr><th class="nosort">Nom</th>
+          <th class="nosort">Depuis</th><th class="nosort">Reconnu au libellé</th>
+          <th class="nosort">Répartition</th><th class="nosort">Automatique</th>
+          <th class="num nosort">Utilisations</th><th class="nosort"></th></tr></thead><tbody>
+          ${S.splitTemplates.map(t => `<tr>
+            <td><b>${esc(t.name)}</b></td>
+            <td>${esc(accById(t.sourceAccountId)?.name || "tous")}</td>
+            <td><code>${esc(t.matchKey || "—")}</code></td>
+            <td>${t.lines.map(l => `<span class="chip">${esc(accById(l.accountId)?.name || "?")}
+              ${l.mode === "percent" ? pct(l.value, 0) : money(l.value, false, 0)}</span>`).join(" ")}</td>
+            <td><label class="inline"><input type="checkbox" ${t.auto!==false?"checked":""}
+              data-act="tplAuto:${t.id}"> oui</label></td>
+            <td class="num">${t.hits || 0}</td>
+            <td><button class="ghost sm" data-act="tplDel:${t.id}">🗑</button></td></tr>`).join("")}
+        </tbody></table></div>
+        <p class="muted" style="margin:8px 0 0">Un modèle automatique s'applique au virement suivant
+          portant le même libellé. La répartition passe par la file « À valider » jusqu'à ce que tu
+          l'aies confirmée une fois et que le mouvement soit reconnu comme habituel.</p>
+      </section>` : ""}
+    </div>`;
+};
+ACTIONS.tplAuto = (id, el) => { const t = S.splitTemplates.find(x => x.id === id);
+  if (t) t.auto = el.checked; save(); };
+ACTIONS.tplDel = id => {
+  if (!confirm("Supprimer ce modèle ? Les répartitions déjà enregistrées ne bougent pas.")) return;
+  S.splitTemplates = S.splitTemplates.filter(t => t.id !== id); save(); render();
+};
 
 /* --- Vue : Pro ----------------------------------------------------------- */
 let PROTAB = "objectif";
@@ -3558,12 +4138,14 @@ ${sheets.map((s, i) => `<Relationship Id="rId${i+1}" Type="http://schemas.openxm
 }
 function exportXLSX(){
   const txs = [...periodTx()].sort((a, b) => a.date < b.date ? -1 : 1);
-  const tx = [["Date","Année","Mois","Compte","Libellé","Type","Catégorie","Fixité","Nature","Montant","Note","Tags"]];
+  const tx = [["Date","Année","Mois","Compte","Libellé","Type","Catégorie","Fixité","Nature","Montant","Note","Tags","Réparti vers"]];
   for (const t of txs){
     const c = catById(t.categoryId);
     tx.push([t.date, +yOf(t.date), +t.date.slice(5,7), accById(t.accountId)?.name || "",
       t.label, { income:"Revenu", expense:"Dépense", transfer:"Virement interne" }[t.type] || t.type,
-      c ? catPath(c.id) : "", c?.fixity || "", c?.nature || "", round2(t.amount), t.note || "", (t.tags||[]).join(", ")]);
+      c ? catPath(c.id) : "", c?.fixity || "", c?.nature || "", round2(t.amount), t.note || "", (t.tags||[]).join(", "),
+      isSplit(t) ? t.splits.map(sp => `${accById(sp.accountId)?.name || "?"} ${round2(sp.amount)}`).join(" | ")
+        : (t.splitParentId ? "(jambe de répartition)" : "")]);
   }
   const ms = recentMonths(36), ids = selectedAccountIds();
   const mois = [["Mois","Revenus","Dépenses","Résultat","Taux d'épargne %"]];
@@ -3583,6 +4165,28 @@ function exportXLSX(){
                   S.transactions.filter(t => t.accountId === a.id).length, (a.keywords||[]).join(", ")]);
   const sheets = [{ name:"Transactions", rows:tx }, { name:"Résumé mensuel", rows:mois },
                   { name:"Catégories", rows:cats }, { name:"Comptes", rows:comptes }];
+  const sav = savingsAccounts();
+  if (sav.length){
+    const totSav = savingsTotal();
+    const rows = [["Compte","Groupe","Solde","Part du total %","Versé sur la période","Objectif","Avancement %"]];
+    const pt = periodTx({ allAccounts:true });
+    for (const a of sav){
+      const bal = accountBalance(a.id);
+      const inA = sum(pt.filter(t => t.accountId === a.id && t.amount > 0), t => t.amount);
+      rows.push([a.name, a.savingsGroup || "", round2(bal), round2(totSav ? bal/totSav*100 : 0),
+                 round2(inA), a.goal?.target || 0,
+                 a.goal?.target ? round2(bal / a.goal.target * 100) : 0]);
+    }
+    rows.push([], ["Total", "", round2(totSav), 100, round2(savingsInflow(pt)), "", ""]);
+    const h = splitHistory();
+    if (h.length){
+      rows.push([], ["Répartitions de virements", ""], ["Date","Depuis","Montant","Destination","Part"]);
+      for (const t of h) for (const sp of t.splits)
+        rows.push([t.date, accById(t.accountId)?.name || "", round2(splitTotal(t)),
+                   accById(sp.accountId)?.name || "", round2(sp.amount)]);
+    }
+    sheets.push({ name:"Épargne", rows });
+  }
   if (S.pro){
     const sol = solveForNet(S.pro);
     const pro = [["Paramètre","Valeur"]];
@@ -3854,6 +4458,8 @@ function migrate(data){
   // un bloc ajouté par une version ultérieure doit apparaître chez les anciens utilisateurs
   for (const b of DEFAULT_BLOCKS)
     if (!s.layout.blocks.some(x => x.id === b.id)) s.layout.blocks.push({ ...b });
+  s.splitTemplates = data.splitTemplates || [];
+  for (const a of s.accounts){ a.savings = !!a.savings; a.savingsGroup = a.savingsGroup || ""; }
   s.taxYears = data.taxYears || defaultTaxYears();
   for (const y of ["2025","2026","2027"]) if (!s.taxYears[y]) s.taxYears[y] = ratesTemplate(+y);
   if (s.pro) s.pro = { ...freshProfile(), ...s.pro,
@@ -3873,8 +4479,15 @@ function demoData(){
   const courant = { id: uid("a"), name:"Compte courant", type:"Compte courant", initialBalance: 1200,
                     color:"#3d6df0", keywords:["COMPTE COURANT"], archived:false };
   const livret  = { id: uid("a"), name:"Livret A", type:"Livret / épargne", initialBalance: 3500,
-                    color:"#1c9c68", keywords:["LIVRET A","VIR LIVRET"], archived:false };
-  S.accounts = [courant, livret];
+                    color:"#1c9c68", keywords:["LIVRET A","VIR LIVRET"], archived:false,
+                    savings:true, savingsGroup:"Précaution", goal:{ target:6000, due:"" } };
+  const per     = { id: uid("a"), name:"PER", type:"Livret / épargne", initialBalance: 2400,
+                    color:"#3d6df0", keywords:["PER"], archived:false,
+                    savings:true, savingsGroup:"Retraite", goal:null };
+  const pocket  = { id: uid("a"), name:"Pocket Vacances", type:"Livret / épargne", initialBalance: 300,
+                    color:"#e0952a", keywords:["POCKET VACANCES"], archived:false,
+                    savings:true, savingsGroup:"Projets", goal:{ target:1500, due:"" } };
+  S.accounts = [courant, livret, per, pocket];
   const cat = n => S.categories.find(c => c.name === n)?.id || "";
   const base = new Date(); base.setDate(1);
   const mk = (mAgo, day, label, amount, catName, type = null, acc = courant.id) => {
@@ -3884,7 +4497,7 @@ function demoData(){
              categoryId: catName ? cat(catName) : "", type: type || (amount >= 0 ? "income" : "expense"),
              needsReview: false, fingerprint: fingerprint(acc, date, amount, label) };
   };
-  const out = [];
+  const out = [], splitDemo = [];
   for (let m = 2; m >= 0; m--){
     out.push(mk(m, 2, "VIR SALAIRE ENTREPRISE", 2450, "Salaire"));
     out.push(mk(m, 3, "PRLV LOYER APPARTEMENT", -820, "Logement"));
@@ -3898,15 +4511,25 @@ function demoData(){
     out.push(mk(m, 20, "CARTE PHARMACIE CENTRALE", -18.9, "Santé & bien-être"));
     out.push(mk(m, 22, "CARTE CINEMA", -12.5, "Divertissement"));
     out.push(mk(m, 25, "FRAIS TENUE DE COMPTE", -2, "Bancaire"));
-    const v1 = mk(m, 28, "VIR LIVRET A", -300, "", "transfer");
-    const v2 = mk(m, 28, "VIR DEPUIS COMPTE COURANT", 300, "", "transfer", livret.id);
-    v1.transferPeerId = v2.id; v2.transferPeerId = v1.id;
-    out.push(v1, v2);
+    // le virement d'épargne mensuel part en un bloc puis se ventile en trois
+    splitDemo.push(mk(m, 28, "VIR EPARGNE MENSUELLE", -300, "", "transfer"));
   }
   out.push(mk(0, 15, "VIR MARTIN DUPONT", -60, ""));
   out.at(-1).needsReview = true;
   out.at(-1).reviewReason = "Virement à un particulier — nature à préciser";
-  S.transactions = out;
+  S.transactions = out.concat(splitDemo);
+  // une clé de répartition, appliquée aux trois virements mensuels
+  const lines = [{ accountId: livret.id, mode:"percent", value:50 },
+                 { accountId: per.id,    mode:"percent", value:35 },
+                 { accountId: pocket.id, mode:"percent", value:15 }];
+  S.splitTemplates = [{ id: uid("st"), name:"Virement épargne mensuel", sourceAccountId: courant.id,
+                        matchKey: labelKey("VIR EPARGNE MENSUELLE"), auto:true, hits: splitDemo.length,
+                        lines: lines.map(l => ({ ...l })) }];
+  for (const tx of splitDemo){
+    tx.splitTemplateId = S.splitTemplates[0].id;
+    applySplits(tx, lines.map(l => ({ ...l })));
+  }
+  S.goals = [];
   S.budgets[cat("Courses")] = 400; S.budgets[cat("Restaurant")] = 120;
   S.budgets[cat("Logement")] = 850; S.budgets[cat("Divertissement")] = 60;
   S.budgets[cat("Transport")] = 80; S.budgets[cat("Abonnement")] = 30;

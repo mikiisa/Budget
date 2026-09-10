@@ -12,10 +12,12 @@ dépendance externe : les graphiques, le parseur CSV et le générateur de fichi
 Ouvre `index.html` dans un navigateur récent. Au premier lancement, choisis de partir de zéro
 ou de charger un jeu de démonstration pour explorer l'interface.
 
-Deux relevés d'exemple sont fournis pour tester l'import :
+Trois relevés d'exemple sont fournis pour tester l'import :
 
 - `exemple-releve-montant-signe.csv` — une colonne de montant, négatif pour les sorties ;
-- `exemple-releve-debit-credit.csv` — colonnes débit et crédit séparées, valeurs entre guillemets.
+- `exemple-releve-debit-credit.csv` — colonnes débit et crédit séparées, valeurs entre guillemets ;
+- `exemple-releve-epargne.csv` — relevé d'un Livret A, pour voir l'absorption des jambes de
+  répartition (voir plus bas).
 
 ## Ce que l'application fait
 
@@ -53,6 +55,39 @@ Deux relevés d'exemple sont fournis pour tester l'import :
 - **Moteur de régularité** : même libellé, montant à ±10 %, même jour du mois à ±2 jours, vu au
   moins 2 fois. Un mouvement ainsi reconnu ne déclenche plus de question. Les seuils sont
   réglables. Le même moteur détecte les abonnements et dépenses récurrentes.
+
+### Répartition de l'épargne
+Un seul virement part du compte courant, et il alimente plusieurs épargnes : Livret A, PER,
+pockets. L'application sait ventiler ce montant unique.
+
+- **Ventilation** d'un virement sortant entre plusieurs comptes, en **euros ou en pourcentage**,
+  au choix ligne par ligne. Le reste à répartir s'affiche en direct, et l'enregistrement est refusé
+  tant que le compte ne tombe pas juste. Le résidu de centimes est reporté sur la dernière ligne :
+  une répartition en tiers ne fait pas dériver les soldes.
+- Pour chaque destination, l'application **réutilise la ligne du relevé** si elle existe déjà,
+  sinon **elle la crée** — les soldes de tes épargnes sont donc justes même si tu ne télécharges
+  jamais leurs relevés.
+- **Absorption** : si tu importes le relevé de l'épargne plus tard, la vraie ligne prend la place
+  de celle qui avait été créée. Une seule transaction subsiste, le solde ne double pas, et le lien
+  vers le virement d'origine est conservé.
+- **Modèles de répartition** nommés et réutilisables. Un modèle reconnaît le virement à son libellé
+  et s'applique au mois suivant, puis la répartition passe par la file « À valider » pour
+  confirmation. Une fois confirmée et le mouvement reconnu comme habituel, elle s'applique
+  silencieusement.
+- Modifier une répartition ne détruit jamais une ligne venue d'un vrai relevé : seules les lignes
+  créées par l'application sont ajustées ou retirées.
+- **Ventiler un virement ne change pas ton résultat du mois** : la sortie et les entrées s'annulent,
+  comme pour n'importe quel mouvement interne.
+
+### Vue Épargne
+- Total épargné, versé sur la période, **effort d'épargne** (versements rapportés aux revenus),
+  avancement global des objectifs.
+- Répartition par compte et par **groupe** (Précaution, Retraite, Projets…).
+- Tableau par épargne : solde, part du total, versements de la période, objectif et versement
+  mensuel nécessaire pour tenir l'échéance.
+- Évolution du total épargné, historique des répartitions, liste des modèles.
+- Les **objectifs adossés à un compte** se remplissent tout seuls depuis son solde : rien à
+  ressaisir chaque mois.
 
 ### Analyse
 - Pourcentages de revenu, de dépense, de reste à dépenser et de dépassement.
@@ -96,8 +131,8 @@ Calcule le **chiffre d'affaires nécessaire pour atteindre un revenu net donné*
 
 ### Sauvegarde et exports
 - **Sauvegarde complète `.json`** — c'est le fichier à conserver.
-- **Classeur `.xlsx`** multi-onglets (Transactions, Résumé mensuel, Catégories, Comptes et,
-  si le profil existe, Objectif pro), généré sans librairie externe.
+- **Classeur `.xlsx`** multi-onglets (Transactions, Résumé mensuel, Catégories, Comptes, Épargne
+  et, si le profil existe, Objectif pro), généré sans librairie externe.
 - **CSV** à séparateur point-virgule avec BOM, prêt pour Excel français.
 - Impression et PDF via le navigateur.
 - Instantanés automatiques avant chaque import (5 derniers conservés) et annulation `Ctrl+Z`.
@@ -114,6 +149,12 @@ Calcule le **chiffre d'affaires nécessaire pour atteindre un revenu net donné*
 | `Ctrl+Z` | Annuler |
 | `Échap` | Fermer une fenêtre |
 | `1` … `9` | Naviguer entre les onglets |
+
+## Comment marquer une épargne
+
+Onglet **Comptes** → modifier le compte → cocher **« c'est une épargne »**. Donne-lui un groupe
+(Précaution, Retraite, Projets…) et, si tu veux, un objectif. Il apparaît alors dans l'onglet
+**Épargne** et devient une destination proposée dans l'éditeur de répartition.
 
 ## Sauvegarde : à lire
 
