@@ -120,6 +120,9 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:now
 .tablewrap{overflow-x:auto}
 .pos{color:var(--pos)} .neg{color:var(--neg)}
 tr.sel{background:var(--accent-soft)!important}
+tr[data-cat].dragging{opacity:.4}
+tr[data-cat].over td{border-top:2px solid var(--accent)}
+tr[data-cat] .grip{cursor:grab;color:var(--muted);user-select:none}
 td.pick,th.pick{width:34px;text-align:center;padding-left:12px;cursor:default}
 .selbar{position:sticky;bottom:0;z-index:30;background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);box-shadow:0 -4px 18px rgba(16,24,40,.10);padding:10px var(--pad);
@@ -479,12 +482,12 @@ const BLOCK_TITLES = {
 
 function freshState(){
   const cats = [
-    ...DEFAULT_CATS.map(([name, color, fixity, nature]) => ({
+    ...DEFAULT_CATS.map(([name, color, fixity, nature], order) => ({
       id: uid("c"), name, color, kind: "expense", fixity, nature,
-      parentId: null, pro: false, archived: false })),
-    ...DEFAULT_INCOME_CATS.map(([name, color]) => ({
+      parentId: null, pro: false, archived: false, order })),
+    ...DEFAULT_INCOME_CATS.map(([name, color], order) => ({
       id: uid("c"), name, color, kind: "income", fixity: "variable", nature: "essentiel",
-      parentId: null, pro: false, archived: false })),
+      parentId: null, pro: false, archived: false, order })),
   ];
   return {
     version: 1,
@@ -635,6 +638,49 @@ const activeAccounts = () => S.accounts.filter(a => !a.archived);
 function catPath(id){
   const c = catById(id); if (!c) return "—";
   return c.parentId ? `${catName(c.parentId)} › ${c.name}` : c.name;
+}
+
+/* --- Ordre des catégories -------------------------------------------------
+   Toutes les listes de catégories passent par ces deux fonctions. Sans ce point
+   de passage unique, chacun des neuf écrans qui énumèrent les catégories aurait
+   son propre tri, et l'un d'eux finirait par diverger.
+   L'ordre est relatif au groupe : les racines d'un même type entre elles, les
+   sous-catégories d'un même parent entre elles.                              */
+const catGroupKey = c => `${c.kind}|${c.parentId || ""}`;
+/** Un groupe, trié par `order` puis par nom — le nom départage des `order` égaux,
+    ce qui arrive après l'import d'une sauvegarde antérieure à ce champ. */
+function sortedCats({ kind = null, parentId = undefined, includeArchived = false } = {}){
+  return S.categories
+    .filter(c => (includeArchived || !c.archived)
+      && (kind ? c.kind === kind : true)
+      && (parentId === undefined || (c.parentId || null) === parentId))
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0)
+      || (a.name || "").localeCompare(b.name || "", "fr"));
+}
+/** Liste à plat pour les menus : chaque sous-catégorie juste après sa mère.
+    Sans type précisé, les dépenses viennent d'abord, puis les revenus : leurs
+    rangs se recouvrent (chaque groupe commence à 0), les mélanger dans un seul
+    tri entrelacerait les deux familles. */
+function catsFlat(kind = null, { includeArchived = false } = {}){
+  if (!kind) return [...catsFlat("expense", { includeArchived }),
+                     ...catsFlat("income",  { includeArchived })];
+  const out = [];
+  for (const c of sortedCats({ kind, parentId: null, includeArchived })){
+    out.push(c);
+    out.push(...sortedCats({ kind: c.kind, parentId: c.id, includeArchived }));
+  }
+  return out;
+}
+/** Prochain rang libre d'un groupe : une nouvelle catégorie arrive en bas. */
+function nextCatOrder(c){
+  const grp = S.categories.filter(x => catGroupKey(x) === catGroupKey(c));
+  return grp.length ? Math.max(...grp.map(x => x.order ?? 0)) + 1 : 0;
+}
+/** Renumérote un groupe 0…n−1 pour que les rangs restent propres. */
+function renumberCatGroup(key){
+  S.categories.filter(c => catGroupKey(c) === key)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+    .forEach((c, i) => { c.order = i; });
 }
 
 /* --- Règles de catégorisation ------------------------------------------- */
@@ -1708,7 +1754,7 @@ VIEWS.tx = () => {
         <label class="f" style="max-width:170px"><span>Compte</span><select data-act="filt:acc">
           <option value="">Tous</option>${S.accounts.map(a => `<option value="${a.id}" ${FILTER.acc===a.id?"selected":""}>${esc(a.name)}</option>`).join("")}</select></label>
         <label class="f" style="max-width:190px"><span>Catégorie</span><select data-act="filt:cat">
-          <option value="">Toutes</option>${S.categories.filter(c=>!c.archived).map(c => `<option value="${c.id}" ${FILTER.cat===c.id?"selected":""}>${esc(catPath(c.id))}</option>`).join("")}</select></label>
+          <option value="">Toutes</option>${catsFlat().map(c => `<option value="${c.id}" ${FILTER.cat===c.id?"selected":""}>${esc(catPath(c.id))}</option>`).join("")}</select></label>
         <label class="f" style="max-width:140px"><span>Type</span><select data-act="filt:type">
           <option value="">Tous</option>
           <option value="income" ${FILTER.type==="income"?"selected":""}>Revenu</option>
@@ -1825,7 +1871,7 @@ ACTIONS.selCat = () => modal({ title:`Classer ${SEL.size} transaction(s)`,
   body:`<p class="muted" style="margin:0">La catégorie sera appliquée à toutes les lignes cochées.</p>
     <label class="f"><span>Catégorie</span><select id="bulk-cat">
       <option value="">— retirer la catégorie —</option>
-      ${S.categories.filter(c=>!c.archived).map(c => `<option value="${c.id}">${esc(catPath(c.id))}</option>`).join("")}
+      ${catsFlat().map(c => `<option value="${c.id}">${esc(catPath(c.id))}</option>`).join("")}
     </select></label>`,
   footer:`<button data-close>Annuler</button><button class="primary" data-act="selCatGo">Appliquer</button>` });
 ACTIONS.selCatGo = () => {
@@ -1937,7 +1983,7 @@ ACTIONS.saveCols = () => {
 /* --- Éditeur de transaction ---------------------------------------------- */
 function txForm(t){
   const accs = activeAccounts();
-  const catOpts = kind => S.categories.filter(c => !c.archived && (kind ? c.kind === kind : true))
+  const catOpts = kind => catsFlat(kind)
     .map(c => `<option value="${c.id}" ${t.categoryId===c.id?"selected":""}>${esc(catPath(c.id))}</option>`).join("");
   return `<div class="grid2">
       <label class="f"><span>Date</span><input type="date" id="f-date" value="${t.date || todayISO()}"></label>
@@ -2306,7 +2352,7 @@ VIEWS.review = () => {
   if (!list.length) return `<h1>À valider</h1>
     <div class="card"><p class="muted" style="margin:0">Rien en attente : toutes les transactions sont classées.</p></div>
     <p class="muted">Y arrivent automatiquement les virements vers des particuliers non reconnus et les lignes qu'aucune règle ne sait classer.</p>`;
-  const cats = S.categories.filter(c => !c.archived);
+  const cats = catsFlat();
   return `<div class="row"><h1 style="margin:0">À valider <span class="muted" style="font-weight:400">— ${list.length}</span></h1>
       <div class="grow"></div><button data-act="reviewAllOther">Tout classer en « Autre »</button></div>
     <p class="muted">Choisis une catégorie : la ligne sort de la file. Une règle te sera proposée pour automatiser la suite.</p>
@@ -2484,33 +2530,48 @@ ACTIONS.runMatch = () => { snapshot("appariement"); matchTransfers(); save(); re
 /* --- Vue : catégories ---------------------------------------------------- */
 VIEWS.cats = () => {
   const draw = kind => {
-    const roots = S.categories.filter(c => c.kind === kind && !c.parentId);
-    return roots.map(c => {
-      const kids = S.categories.filter(k => k.parentId === c.id);
-      return catRow(c) + kids.map(k => catRow(k, true)).join("");
-    }).join("") || `<tr><td colspan="6" class="muted" style="padding:18px;text-align:center">Aucune catégorie.</td></tr>`;
+    const roots = sortedCats({ kind, parentId: null, includeArchived: true });
+    return roots.map((c, i) => {
+      const kids = sortedCats({ parentId: c.id, includeArchived: true });
+      return catRow(c, false, i, roots.length)
+        + kids.map((k, j) => catRow(k, true, j, kids.length)).join("");
+    }).join("") || `<tr><td colspan="7" class="muted" style="padding:18px;text-align:center">Aucune catégorie.</td></tr>`;
   };
   return `<div class="row"><h1 style="margin:0">Catégories</h1><div class="grow"></div>
       <button class="primary" data-act="newCat:expense">+ Catégorie de dépense</button>
       <button data-act="newCat:income">+ Catégorie de revenu</button></div>
     <p class="muted">Chaque catégorie de dépense porte deux axes supplémentaires : <b>fixe / variable</b>
       et <b>essentiel / loisir / épargne</b>. Ils alimentent les pourcentages des statistiques.</p>
-    <h3 style="margin-top:14px">Dépenses</h3>
-    <div class="card tablewrap" style="padding:0"><table><thead><tr>
+    <p class="muted">Glisse la poignée ⠿ ou utilise les flèches pour choisir l'ordre. Il s'applique
+      partout : menus de saisie, file « À valider », filtres, règles et budgets. Les statistiques,
+      elles, restent classées par montant — c'est un classement, pas une liste.</p>
+    <div class="row tight" style="margin-top:14px">
+      <h3 style="margin:0">Dépenses</h3><div class="grow"></div>
+      <button class="sm" data-act="catSortAZ:expense">A → Z</button>
+      <button class="sm" data-act="catSortAmount:expense">Par montant</button>
+    </div>
+    <div class="card tablewrap" style="padding:0;margin-top:8px"><table><thead><tr>
+      <th class="pick nosort"></th>
       <th class="nosort">Catégorie</th><th class="nosort">Fixité</th><th class="nosort">Nature</th>
       <th class="num nosort">Budget / mois</th><th class="num nosort">Lignes</th><th class="nosort"></th>
-    </tr></thead><tbody>${draw("expense")}</tbody></table></div>
-    <h3 style="margin-top:18px">Revenus</h3>
-    <div class="card tablewrap" style="padding:0"><table><thead><tr>
+    </tr></thead><tbody class="catbody">${draw("expense")}</tbody></table></div>
+    <div class="row tight" style="margin-top:18px">
+      <h3 style="margin:0">Revenus</h3><div class="grow"></div>
+      <button class="sm" data-act="catSortAZ:income">A → Z</button>
+      <button class="sm" data-act="catSortAmount:income">Par montant</button>
+    </div>
+    <div class="card tablewrap" style="padding:0;margin-top:8px"><table><thead><tr>
+      <th class="pick nosort"></th>
       <th class="nosort">Catégorie</th><th class="nosort"></th><th class="nosort"></th>
       <th class="nosort"></th><th class="num nosort">Lignes</th><th class="nosort"></th>
-    </tr></thead><tbody>${draw("income")}</tbody></table></div>`;
+    </tr></thead><tbody class="catbody">${draw("income")}</tbody></table></div>`;
 };
-function catRow(c, child = false){
+function catRow(c, child = false, pos = 0, total = 1){
   const n = S.transactions.filter(t => t.categoryId === c.id).length;
   const FX = { fixe:"Fixe", variable:"Variable" };
   const NT = { essentiel:"Essentiel", loisir:"Loisir", epargne:"Épargne" };
-  return `<tr ${c.archived?'style="opacity:.5"':""}>
+  return `<tr data-cat="${c.id}" data-grp="${esc(catGroupKey(c))}" ${c.archived?'style="opacity:.5"':""}>
+    <td class="pick"><span class="grip" draggable="true" title="Glisser pour déplacer">⠿</span></td>
     <td>${child ? '<span class="muted">↳ </span>' : ""}<span class="chip">
       <i class="sw" style="background:${catColor(c.id)}"></i>${esc(c.name)}</span>
       ${c.pro?'<span class="pill vir">pro</span>':""}</td>
@@ -2519,11 +2580,86 @@ function catRow(c, child = false){
     <td class="num">${c.kind === "expense" ? (S.budgets[c.id] ? money(S.budgets[c.id], false, 0) : `<span class="muted">—</span>`) : ""}</td>
     <td class="num">${n}</td>
     <td style="white-space:nowrap">
+      <button class="ghost sm" data-act="catMove:${c.id}|-1" ${pos === 0 ? "disabled" : ""} title="Monter">▲</button>
+      <button class="ghost sm" data-act="catMove:${c.id}|1" ${pos === total - 1 ? "disabled" : ""} title="Descendre">▼</button>
       <button class="ghost sm" data-act="editCat:${c.id}">✎</button>
       <button class="ghost sm" data-act="delCat:${c.id}">🗑</button></td></tr>`;
 }
+
+/* --- Réordonnancement des catégories -------------------------------------- */
+/** Déplace une catégorie d'un cran dans son groupe. */
+ACTIONS.catMove = arg => {
+  const [id, dir] = arg.split("|");
+  const c = catById(id); if (!c) return;
+  const grp = sortedCats({ kind: c.kind, parentId: c.parentId || null, includeArchived: true });
+  const i = grp.findIndex(x => x.id === id), j = i + (+dir);
+  if (i < 0 || j < 0 || j >= grp.length) return;
+  snapshot("ordre des catégories");
+  grp.splice(j, 0, grp.splice(i, 1)[0]);
+  grp.forEach((x, k) => { x.order = k; });
+  save(); render();
+};
+/** Glisser-déposer, calqué sur celui des blocs du tableau de bord.
+    Le dépôt n'est accepté qu'à l'intérieur du même groupe : une racine ne doit
+    pas devenir sous-catégorie par un glissement de travers — cela reste le rôle
+    du champ « sous-catégorie de » du formulaire, qui est explicite. */
+let dragCat = null;
+function initCatDnD(){
+  $$("tr[data-cat]").forEach(tr => {
+    const grip = $(".grip", tr);
+    grip && grip.addEventListener("dragstart", e => {
+      dragCat = { id: tr.dataset.cat, grp: tr.dataset.grp };
+      tr.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", dragCat.id);
+    });
+    grip && grip.addEventListener("dragend", () => {
+      dragCat = null;
+      $$("tr[data-cat]").forEach(x => x.classList.remove("dragging", "over"));
+    });
+    tr.addEventListener("dragover", e => {
+      if (!dragCat || tr.dataset.cat === dragCat.id || tr.dataset.grp !== dragCat.grp) return;
+      e.preventDefault(); tr.classList.add("over");
+    });
+    tr.addEventListener("dragleave", () => tr.classList.remove("over"));
+    tr.addEventListener("drop", e => {
+      e.preventDefault(); tr.classList.remove("over");
+      if (!dragCat || tr.dataset.grp !== dragCat.grp) return;   // hors groupe : refusé
+      const c = catById(dragCat.id); if (!c) return;
+      const grp = sortedCats({ kind: c.kind, parentId: c.parentId || null, includeArchived: true });
+      const from = grp.findIndex(x => x.id === dragCat.id);
+      const to = grp.findIndex(x => x.id === tr.dataset.cat);
+      if (from < 0 || to < 0 || from === to) return;
+      snapshot("ordre des catégories");
+      grp.splice(to, 0, grp.splice(from, 1)[0]);
+      grp.forEach((x, k) => { x.order = k; });
+      save(); render();
+    });
+  });
+}
+/** Tri rapide : réécrit les rangs des racines et de chaque fratrie. */
+function applyCatSort(kind, rank){
+  snapshot("tri des catégories");
+  const groups = [sortedCats({ kind, parentId: null, includeArchived: true })];
+  for (const root of groups[0])
+    groups.push(sortedCats({ parentId: root.id, includeArchived: true }));
+  for (const grp of groups){
+    grp.map(c => ({ c, r: rank(c) }))
+       .sort((a, b) => a.r - b.r || (a.c.name || "").localeCompare(b.c.name || "", "fr"))
+       .forEach(({ c }, i) => { c.order = i; });
+  }
+  save(); render();
+}
+ACTIONS.catSortAZ = kind => { applyCatSort(kind, () => 0); toast("Classées de A à Z"); };
+ACTIONS.catSortAmount = kind => {
+  // les montants de la période affichée ; une catégorie sans mouvement passe à la fin
+  const tot = new Map(byCategory(periodTx(), kind === "income" ? "income" : "expense")
+    .map(d => [d.id, d.value]));
+  applyCatSort(kind, c => -(tot.get(c.id) || 0));
+  toast("Classées par montant sur la période affichée");
+};
 function catForm(c){
-  const parents = S.categories.filter(x => x.kind === c.kind && !x.parentId && x.id !== c.id);
+  const parents = sortedCats({ kind: c.kind, parentId: null }).filter(x => x.id !== c.id);
   return `<div class="grid2">
       <label class="f"><span>Nom</span><input id="c-name" value="${esc(c.name||"")}"></label>
       <label class="f"><span>Couleur</span><input type="color" id="c-color"
@@ -2562,11 +2698,14 @@ ACTIONS.saveCat = arg => {
   c.name = name; c.color = $("#c-color").value; c.pro = $("#c-pro").checked;
   if (c.kind === "expense"){
     c.fixity = $("#c-fixity").value; c.nature = $("#c-nature").value;
+    const parentBefore = c.parentId || null;
     c.parentId = $("#c-parent").value || null;
+    // changer de parent, c'est changer de groupe : la catégorie se range en bas du nouveau
+    if (!isNew && (c.parentId || null) !== parentBefore) c.order = nextCatOrder(c);
     const b = +$("#c-budget").value || 0;
     if (b > 0) S.budgets[c.id] = b; else delete S.budgets[c.id];
   }
-  if (isNew) S.categories.push(c);
+  if (isNew){ c.order = nextCatOrder(c); S.categories.push(c); }
   save(); closeModal(); render(); toast("Catégorie enregistrée");
 };
 ACTIONS.delCat = id => {
@@ -2656,7 +2795,7 @@ function ruleForm(r){
     </div>
     <fieldset><legend>Alors</legend><div class="grid2">
       <label class="f"><span>Catégorie</span><select id="r-cat"><option value="">— ne rien changer —</option>
-        ${S.categories.filter(c=>!c.archived).map(c => `<option value="${c.id}" ${r.set?.categoryId===c.id?"selected":""}>${esc(catPath(c.id))}</option>`).join("")}</select></label>
+        ${catsFlat().map(c => `<option value="${c.id}" ${r.set?.categoryId===c.id?"selected":""}>${esc(catPath(c.id))}</option>`).join("")}</select></label>
       <label class="f"><span>Type</span><select id="r-type"><option value="">— ne rien changer —</option>
         <option value="expense" ${r.set?.type==="expense"?"selected":""}>Dépense</option>
         <option value="income" ${r.set?.type==="income"?"selected":""}>Revenu</option>
@@ -3242,7 +3381,7 @@ VIEWS.stats = () => {
 /* --- Vue : budgets ------------------------------------------------------- */
 VIEWS.budgets = () => {
   const txs = periodTx(), bs = budgetStatus(txs), T = totals(txs);
-  const cats = S.categories.filter(c => c.kind === "expense" && !c.archived);
+  const cats = catsFlat("expense");
   const daysIn = S.settings.period.mode === "month" ? new Date(+S.settings.period.ym.slice(0,4), +S.settings.period.ym.slice(5,7), 0).getUTCDate() : 30;
   const dayNow = S.settings.period.ym === todayISO().slice(0,7) ? +todayISO().slice(8,10) : daysIn;
   const projected = bs.used / Math.max(1, dayNow) * daysIn;
@@ -4412,7 +4551,7 @@ function exportXLSX(){
     mois.push([m, round2(T.income), round2(T.expense), round2(T.net), round2(T.savingRate)]);
   }
   const cats = [["Catégorie","Type","Fixité","Nature","Budget mensuel","Dépensé sur la période"]];
-  for (const c of S.categories){
+  for (const c of catsFlat(null, { includeArchived: true })){
     const used = sum(periodTx().filter(t => t.categoryId === c.id), t => Math.abs(t.amount));
     cats.push([catPath(c.id), c.kind === "income" ? "Revenu" : "Dépense", c.fixity || "", c.nature || "",
                S.budgets[c.id] || 0, round2(used)]);
@@ -4733,6 +4872,15 @@ function migrate(data){
     if (!t.tags) t.tags = [];
   }
   normalizeTypes(s.transactions);
+  // l'ordre d'affichage était jusqu'ici celui du tableau : on le fige tel quel,
+  // pour que rien ne bouge à l'ouverture d'une sauvegarde existante
+  const seen = new Map();
+  for (const c of s.categories){
+    if (typeof c.order === "number") continue;
+    const k = `${c.kind}|${c.parentId || ""}`;
+    const i = seen.get(k) ?? 0;
+    c.order = i; seen.set(k, i + 1);
+  }
   return s;
 }
 function demoData(){
@@ -4879,6 +5027,7 @@ render = function(){
   _render();
   initDashDnD(); initDrop();
   if (VIEW === "tx") initSelection();
+  if (VIEW === "cats") initCatDnD();
 };
 
 boot();

@@ -68,6 +68,12 @@ Trois relevés d'exemple sont fournis pour tester l'import :
 ### Catégorisation
 - Catégories de dépense et de revenu, ajoutables, renommables, supprimables, avec
   sous-catégories.
+- **Ordre personnalisé** : glisse la poignée ⠿ ou utilise les flèches ▲▼ pour ranger tes
+  catégories comme tu veux, dépenses et revenus séparément. Deux tris rapides — alphabétique et
+  par montant dépensé sur la période — servent de point de départ, et restent modifiables à la
+  main. Cet ordre s'applique **partout** : menus de saisie, file « À valider », filtres, règles,
+  classement en masse, tableau des budgets et export. Les statistiques, elles, restent classées
+  par montant décroissant : c'est un classement, pas une liste.
 - Deux axes supplémentaires par catégorie de dépense : **fixe / variable** et
   **essentiel / loisir / épargne**.
 - Moteur de **règles** éditables (contient, commence par, égal, expression régulière, plage de
